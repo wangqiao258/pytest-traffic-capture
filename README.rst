@@ -7,7 +7,7 @@ HAR 1.2 文档以及可重放的 cURL 命令。
 功能特性
 --------
 
-* 捕获使用 ``requests``、``httpx``（同步和异步）以及 ``aiohttp`` 进行的 HTTP
+* 捕获使用 ``requests``、``httpx`` （同步和异步）以及 ``aiohttp`` 进行的 HTTP
   交换。
 * 每个测试写入一个 ``.har`` 文件和一个 ``.curl.txt`` 文件。
 * 将较大的 body 移到 sidecar 文件，而不是撑大 HAR 文档。
@@ -54,7 +54,7 @@ HAR 1.2 文档以及可重放的 cURL 命令。
 
 ``--capture-max-body-bytes N``
     每个请求或响应 body 捕获的最大字节数。更大的 body 会在产物中被截断，并标记
-    ``_truncated`` 和 ``_size``；cURL 重放会被标注为不完整。默认为 ``0``（无限制）。
+    ``_truncated`` 和 ``_size``；cURL 重放会被标注为不完整。默认为 ``0`` （无限制）。
 
 同样的设置也可以在 ``pytest.ini`` 中配置::
 
