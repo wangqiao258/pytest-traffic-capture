@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import socket
 import threading
 import time
 from email.parser import BytesParser
@@ -115,6 +116,22 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/no-content":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if path == "/not-modified":
+            self.send_response(304)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if path == "/empty":
+            self._write(200, b"", "text/plain")
+            return
+
         if path == "/download":
             size = 65536
             query = dict(
@@ -207,6 +224,12 @@ class _Handler(BaseHTTPRequestHandler):
     do_PATCH = _dispatch
     do_DELETE = _dispatch
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "5")
+        self.end_headers()
+
 
 class _Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
@@ -235,3 +258,13 @@ def read_har():
         return json.loads(files[0].read_text(encoding="utf-8"))
 
     return _read
+
+
+@pytest.fixture
+def closed_port():
+    """返回一个刚释放、预期无人监听的本地端口。"""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port

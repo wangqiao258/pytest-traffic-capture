@@ -365,6 +365,15 @@ def _redirect_url(status: int, headers: Sequence) -> str:
     return ""
 
 
+def _bodiless_response(status: int, method: str, headers: Sequence) -> bool:
+    """响应按定义没有体（HEAD、204、304、Content-Length: 0）。"""
+    return (
+        str(method or "").upper() == "HEAD"
+        or int(status) in (204, 304)
+        or _header(headers, "content-length").strip() == "0"
+    )
+
+
 def _requests_http_version(response) -> str:
     version = getattr(getattr(response, "raw", None), "version", None)
     if version == 10:
@@ -510,6 +519,29 @@ def _is_requests_stream_body(body) -> bool:
     return hasattr(body, "__iter__")
 
 
+def _is_requests_too_many_redirects(exc: BaseException) -> bool:
+    try:
+        import requests
+    except Exception:
+        return False
+    return isinstance(exc, requests.exceptions.TooManyRedirects)
+
+
+def _requests_not_sent(exc: BaseException) -> bool:
+    try:
+        import requests
+        from urllib3.exceptions import ProtocolError
+    except Exception:
+        return False
+    if not isinstance(exc, requests.exceptions.ConnectionError):
+        return False
+    cause = exc.args[0] if exc.args else None
+    # ProtocolError/OSError 也可能发生在请求发出之后（例如读取响应时连接
+    # 被重置），这类失败不能标记为未发送。ConnectionError 的其余来源
+    # （连接被拒绝、连接超时、代理或 TLS 握手失败）都发生在建立连接阶段。
+    return not isinstance(cause, (ProtocolError, OSError))
+
+
 def _tee_iterable(iterable, collector: _BodyCollector):
     for chunk in iterable:
         if isinstance(chunk, bytes):
@@ -600,12 +632,16 @@ def _response_from_requests(response, streaming: bool, collector=None) -> Respon
         except Exception:
             is_streaming = True
     headers = _response_headers_from_requests(response)
-    if is_streaming and (
-        response.status_code in (204, 304)
-        or _header(headers, "content-length") == "0"
+    if _bodiless_response(
+        response.status_code,
+        getattr(getattr(response, "request", None), "method", ""),
+        headers,
     ):
+        # 无体响应即使走 stream=True 也没有可收集的字节；必须报告 0，
+        # 而不是把未读取的体当作未知大小。
         body = b""
         is_streaming = False
+        provider = None
     truncated = False
     full_body_size = None
     if body is not None:
@@ -679,6 +715,7 @@ def _make_requests_send(original):
                         tee_collector, tee_expected
                     )
                 failed_response = getattr(exc, "response", None)
+                truncated = _is_requests_too_many_redirects(exc)
                 hops = (
                     list(getattr(failed_response, "history", None) or [])
                     + [failed_response]
@@ -688,6 +725,7 @@ def _make_requests_send(original):
                 if hops:
                     cumulative_ms = 0.0
                     for index, hop in enumerate(hops):
+                        is_last = index == len(hops) - 1
                         request_record = _request_from_requests(
                             hop.request,
                             snapshot=hop_snapshot(hop.request),
@@ -707,17 +745,18 @@ def _make_requests_send(original):
                                 started_at=hop_start,
                                 elapsed_ms=hop_ms,
                                 response=_response_from_requests(hop, streaming=True),
-                                error=(
-                                    _format_error(exc)
-                                    if index == len(hops) - 1
-                                    else None
-                                ),
+                                error=_format_error(exc) if is_last else None,
+                                redirects_truncated=truncated and is_last,
                             )
                         )
                 else:
+                    request_record = _request_from_requests(
+                        request, snapshot=snapshot
+                    )
+                    request_record.not_sent = _requests_not_sent(exc)
                     recorder.record(
                         Exchange(
-                            request=_request_from_requests(request, snapshot=snapshot),
+                            request=request_record,
                             started_at=started_at,
                             elapsed_ms=_elapsed_ms(start),
                             error=_format_error(exc),
@@ -865,6 +904,14 @@ def _is_httpx_too_many_redirects(exc: BaseException) -> bool:
     return isinstance(exc, httpx.TooManyRedirects)
 
 
+def _httpx_not_sent(exc: BaseException) -> bool:
+    try:
+        import httpx
+    except Exception:
+        return False
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
 def _record_httpx_error(
     recorder,
     hops,
@@ -877,13 +924,15 @@ def _record_httpx_error(
 ) -> None:
     error = _format_error(exc)
     truncated = _is_httpx_too_many_redirects(exc)
+    not_sent = _httpx_not_sent(exc)
     if not hops:
         request_record = _request_from_httpx(
             request, first_body, first_unreadable
         )
-        if truncated:
+        if truncated or not_sent:
             # httpx 抛出 TooManyRedirects 时携带的是下一个请求，而它从未
-            # 发送；消费方不得把它误当作线上实际传输的流量。
+            # 发送；连接阶段的失败同样没有到达传输层。消费方不得把这些
+            # 请求误当作线上实际传输的流量。
             request_record.not_sent = True
         recorder.record(
             Exchange(
@@ -909,6 +958,8 @@ def _record_httpx_error(
                 else "HTTP/1.1"
             ),
         )
+        if is_last and hop_response is None and not_sent:
+            request_record.not_sent = True
         response_record = (
             _response_from_httpx(hop_response, streaming=False)
             if hop_response is not None
@@ -947,11 +998,14 @@ def _response_from_httpx(response, streaming: bool, collector=None) -> ResponseR
     except Exception:
         headers = [(str(key), str(value)) for key, value in response.headers.items()]
     status = response.status_code
-    if is_streaming and (
-        status in (204, 304) or _header(headers, "content-length") == "0"
+    if _bodiless_response(
+        status,
+        getattr(getattr(response, "request", None), "method", ""),
+        headers,
     ):
         body = b""
         is_streaming = False
+        provider = None
     truncated = False
     full_body_size = None
     if body is not None:
@@ -1225,11 +1279,12 @@ def _snapshot_file(
         if full_size is not None and full_size < 0:
             full_size = None
         # 文本模式的 ``tell()`` 可能返回不透明 cookie 而非字节偏移，
-        # 因此只对二进制文件使用有界读取。
+        # 因此不对文本流使用 ``fstat`` 得到的大小。
         binary = "b" in str(getattr(value, "mode", "b") or "b")
-        if limit > 0 and binary:
+        if limit > 0:
             # 始终有界读取：即使拿不到文件大小（例如管道包装或异常流），
-            # 也不能把整个文件读进内存。
+            # 也不能把整个文件读进内存。文本模式读取 ``limit + 1`` 个字符，
+            # 其编码后的字节数不会少于字符数。
             data = read(limit + 1)
             if isinstance(data, str):
                 data = data.encode(encoding)
@@ -1237,21 +1292,14 @@ def _snapshot_file(
             if len(data) > limit:
                 return _Snapshot(
                     data=data[:limit],
-                    size=full_size,
+                    size=full_size if binary else None,
                     truncated=True,
                 )
             return _Snapshot(data=data)
         data = read()
         if isinstance(data, str):
             data = data.encode(encoding)
-        data = bytes(data)
-        if limit > 0 and len(data) > limit:
-            return _Snapshot(
-                data=data[:limit],
-                size=len(data),
-                truncated=True,
-            )
-        return _Snapshot(data=data)
+        return _Snapshot(data=bytes(data))
     except Exception:
         pass
     finally:
@@ -1559,7 +1607,11 @@ def _aiohttp_error_url_object(session, method: str, url, kwargs):
     try:
         from yarl import URL
 
-        target = URL(str(url))
+        try:
+            # 与 aiohttp 自身一致：相对 URL 需要用会话的 base_url 展开。
+            target = session._build_url(str(url))
+        except Exception:
+            target = URL(str(url))
         params = kwargs.get("params")
         if params:
             target = target.update_query(params)
@@ -1817,19 +1869,18 @@ def _make_aiohttp_request(original):
                 return
             elapsed = _elapsed_ms(start)
             for index, hop in enumerate(history):
+                is_last = index == len(history) - 1
                 recorder.record(
                     Exchange(
                         request=_aiohttp_hop_request(hop, index, payload),
                         started_at=started_at,
-                        elapsed_ms=elapsed if index == len(history) - 1 else 0.0,
+                        elapsed_ms=elapsed if is_last else 0.0,
                         response=_response_from_aiohttp(
                             hop, body=None, streaming=True
                         ),
-                        error=(
-                            _format_error(exc)
-                            if index == len(history) - 1
-                            else None
-                        ),
+                        error=_format_error(exc) if is_last else None,
+                        # 携带 history 的异常意味着重定向链没能走完。
+                        redirects_truncated=is_last,
                     )
                 )
 

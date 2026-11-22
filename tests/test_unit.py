@@ -15,8 +15,13 @@ from pytest_traffic_capture.adapters import (
     _BodyCollector,
     _make_reader_readuntil,
     _request_from_requests,
+    _requests_not_sent,
     _snapshot_file,
     _TeeReader,
+)
+from pytest_traffic_capture.exporters import (
+    _request_cookies,
+    _response_cookies,
 )
 from pytest_traffic_capture.recorder import (
     _TestSession,
@@ -74,6 +79,23 @@ def test_aiohttp_connector_error_is_treated_as_not_sent():
 
     assert _aiohttp_not_sent(exc) is True
     assert _aiohttp_not_sent(RuntimeError("boom")) is False
+
+
+def test_requests_connect_timeout_is_treated_as_not_sent():
+    requests = pytest.importorskip("requests")
+
+    exc = requests.exceptions.ConnectTimeout("timed out")
+
+    assert _requests_not_sent(exc) is True
+
+
+def test_requests_protocol_error_is_not_treated_as_not_sent():
+    requests = pytest.importorskip("requests")
+    from urllib3.exceptions import ProtocolError
+
+    exc = requests.exceptions.ConnectionError(ProtocolError("reset"))
+
+    assert _requests_not_sent(exc) is False
 
 
 def test_aiohttp_seekable_file_is_snapshotted_and_restored():
@@ -273,6 +295,68 @@ def test_snapshot_file_keeps_body_below_limit_when_size_is_unknown():
     assert snapshot.truncated is False
     assert snapshot.data == b"y" * 50
     assert stream.tell() == 0
+
+
+class _TextStream:
+    """文本模式的可回绕流，读取按字符计量。"""
+
+    mode = "r"
+
+    def __init__(self, data: str) -> None:
+        self._data = data
+        self._position = 0
+        self.chars_read = 0
+
+    def read(self, size=-1):
+        end = len(self._data) if size < 0 else self._position + size
+        data = self._data[self._position:end]
+        self._position += len(data)
+        self.chars_read += len(data)
+        return data
+
+    def tell(self):
+        return self._position
+
+    def seek(self, position, whence=0):
+        self._position = position
+        return position
+
+    def seekable(self):
+        return True
+
+    def fileno(self):
+        raise OSError("no file descriptor")
+
+
+def test_snapshot_file_bounds_text_mode_read():
+    stream = _TextStream("x" * 4096)
+
+    snapshot = _snapshot_file(stream, limit=100)
+
+    assert snapshot.truncated is True
+    assert snapshot.data == b"x" * 100
+    assert stream.chars_read == 101
+    assert stream.tell() == 0
+
+
+def test_request_cookies_are_parsed():
+    cookies = _request_cookies([("Cookie", "a=1; b=2")])
+
+    assert cookies == [
+        {"name": "a", "value": "1"},
+        {"name": "b", "value": "2"},
+    ]
+
+
+def test_response_cookies_keep_duplicate_headers():
+    cookies = _response_cookies(
+        [
+            ("Set-Cookie", "a=1; Path=/"),
+            ("Set-Cookie", "b=2; Path=/"),
+        ]
+    )
+
+    assert [cookie["name"] for cookie in cookies] == ["a", "b"]
 
 
 def test_safe_hint_strips_control_characters():

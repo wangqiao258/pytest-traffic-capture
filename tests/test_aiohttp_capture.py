@@ -383,6 +383,37 @@ def test_aiohttp_redirect_loop_records_history(
     assert len(entries) > 1
     assert all(entry["response"]["status"] == 302 for entry in entries)
     assert "TooManyRedirects" in entries[-1]["_error"]
+    assert entries[-1]["_redirects_truncated"] is True
+
+
+def test_aiohttp_connection_error_uses_base_url(
+    pytester, closed_port, read_har
+):
+    pytester.makepyfile(
+        """
+        import asyncio
+        import aiohttp
+        import pytest
+
+        def test_refused():
+            async def scenario():
+                base = "http://127.0.0.1:{port}"
+                async with aiohttp.ClientSession(base_url=base) as session:
+                    with pytest.raises(aiohttp.ClientConnectorError):
+                        await session.get("/x", params={{"a": "1"}})
+
+            asyncio.run(scenario())
+        """.format(port=closed_port)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    entry = read_har(pytester)["log"]["entries"][0]
+    assert entry["request"]["url"] == (
+        "http://127.0.0.1:{}/x?a=1".format(closed_port)
+    )
+    assert entry["request"]["_not_sent"] is True
 
 
 def test_aiohttp_formdata_body_size_is_exact(

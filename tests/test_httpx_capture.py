@@ -264,3 +264,64 @@ def test_httpx_async_streaming_body_is_collected(
     content = entry["response"]["content"]
     assert content["size"] == 65536
     assert base64.b64decode(content["text"]) == b"x" * 65536
+
+
+def test_httpx_streaming_bodiless_responses_report_zero(
+    pytester, http_server, read_har
+):
+    pytester.makepyfile(
+        """
+        import httpx
+
+        def test_bodiless():
+            with httpx.Client() as client:
+                with client.stream(
+                    "GET", {url!r} + "/no-content", timeout=5
+                ):
+                    pass
+                with client.stream(
+                    "GET", {url!r} + "/not-modified", timeout=5
+                ):
+                    pass
+                with client.stream(
+                    "GET", {url!r} + "/empty", timeout=5
+                ):
+                    pass
+                with client.stream(
+                    "HEAD", {url!r} + "/head", timeout=5
+                ):
+                    pass
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    entries = read_har(pytester)["log"]["entries"]
+    assert len(entries) == 4
+    for entry in entries:
+        assert "_streaming" not in entry
+        assert entry["response"]["content"]["size"] == 0
+        assert entry["response"]["bodySize"] == 0
+
+
+def test_httpx_connection_error_is_marked_not_sent(
+    pytester, closed_port, read_har
+):
+    pytester.makepyfile(
+        """
+        import httpx
+        import pytest
+
+        def test_refused():
+            with pytest.raises(httpx.ConnectError):
+                httpx.get("http://127.0.0.1:{port}/x", timeout=5)
+        """.format(port=closed_port)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    entry = read_har(pytester)["log"]["entries"][0]
+    assert entry["request"]["_not_sent"] is True
+    assert "ConnectError" in entry["_error"]

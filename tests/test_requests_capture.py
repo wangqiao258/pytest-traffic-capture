@@ -166,6 +166,7 @@ def test_requests_redirect_loop_records_history(
     assert len(entries) > 1
     assert all(entry["response"]["status"] == 302 for entry in entries)
     assert "TooManyRedirects" in entries[-1]["_error"]
+    assert entries[-1]["_redirects_truncated"] is True
 
 
 def test_requests_file_like_upload_is_captured(
@@ -373,3 +374,55 @@ def test_requests_upload_cap_only_truncates_capture(
         pytester.path / "captured_traffic" / request["postData"]["_file"]
     )
     assert len(sidecar.read_bytes()) == 1024
+
+
+def test_requests_streaming_bodiless_responses_report_zero(
+    pytester, http_server, read_har
+):
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_bodiless():
+            session = requests.Session()
+            try:
+                session.get({url!r} + "/no-content", stream=True, timeout=5)
+                session.get({url!r} + "/not-modified", stream=True, timeout=5)
+                session.get({url!r} + "/empty", stream=True, timeout=5)
+                session.head({url!r} + "/head", stream=True, timeout=5)
+            finally:
+                session.close()
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    entries = read_har(pytester)["log"]["entries"]
+    assert len(entries) == 4
+    for entry in entries:
+        assert "_streaming" not in entry
+        assert entry["response"]["content"]["size"] == 0
+        assert entry["response"]["bodySize"] == 0
+
+
+def test_requests_connection_error_is_marked_not_sent(
+    pytester, closed_port, read_har
+):
+    pytester.makepyfile(
+        """
+        import pytest
+        import requests
+
+        def test_refused():
+            with pytest.raises(requests.exceptions.ConnectionError):
+                requests.get("http://127.0.0.1:{port}/x", timeout=5)
+        """.format(port=closed_port)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    entry = read_har(pytester)["log"]["entries"][0]
+    assert entry["request"]["_not_sent"] is True
+    assert "ConnectionError" in entry["_error"]
