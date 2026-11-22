@@ -147,6 +147,9 @@ def test_aiohttp_readexactly_is_collected(pytester, http_server, read_har):
                         {url!r} + "/download?size=21&chunked=1", timeout=5
                     ) as response:
                         payload = await response.content.readexactly(21)
+                        # 读完到 EOF，确保终止块已被解析；仅在 readexactly
+                        # 后退出时，body 是否标记为 streaming 取决于分块时序。
+                        await response.content.read()
                 assert payload == b"x" * 21
 
             asyncio.run(scenario())
