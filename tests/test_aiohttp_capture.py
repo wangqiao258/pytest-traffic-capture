@@ -578,3 +578,123 @@ def test_aiohttp_upload_cap_only_truncates_capture(
         pytester.path / "captured_traffic" / request["postData"]["_file"]
     )
     assert len(sidecar.read_bytes()) == 1024
+
+
+def test_aiohttp_json_body_respects_capture_cap(pytester, http_server, read_har):
+    blob = "x" * 4096
+
+    pytester.makepyfile(
+        """
+        import asyncio
+        import aiohttp
+
+        def test_big():
+            async def scenario():
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        {url!r} + "/upload",
+                        json={{"blob": {blob!r}}},
+                        timeout=5,
+                    ) as response:
+                        await response.read()
+
+            asyncio.run(scenario())
+        """.format(url=http_server, blob=blob)
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "--capture-traffic", "--capture-max-body-bytes=1024"
+    )
+
+    result.assert_outcomes(passed=1)
+    result.stdout.fnmatch_lines(["*truncated 1 body(ies)*"])
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    assert request["_truncated"] is True
+    assert request["_size"] > 1024
+    assert request["bodySize"] == request["_size"]
+    assert len(request["postData"]["text"].encode("utf-8")) == 1024
+
+
+def test_aiohttp_formdata_text_field_respects_capture_cap(
+    pytester, http_server, read_har
+):
+    blob = "x" * 4096
+
+    pytester.makepyfile(
+        """
+        import asyncio
+        import aiohttp
+
+        def test_upload():
+            async def scenario():
+                form = aiohttp.FormData()
+                form.add_field("blob", {blob!r})
+                form.add_field("file", b"abc", filename="a.bin")
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        {url!r} + "/echo", data=form, timeout=5
+                    ) as response:
+                        await response.read()
+
+            asyncio.run(scenario())
+        """.format(url=http_server, blob=blob)
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "--capture-traffic", "--capture-max-body-bytes=1024"
+    )
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    assert request["_truncated"] is True
+    params = {
+        item["name"]: item for item in request["postData"]["params"]
+    }
+    assert params["blob"]["value"] == "x" * 1024
+    assert params["blob"]["_truncated"] is True
+    assert params["blob"]["_size"] == len(blob)
+    assert params["file"]["_file"]
+
+
+def test_aiohttp_formdata_text_field_respects_inline_cap(
+    pytester, http_server, read_har
+):
+    blob = "x" * 512
+
+    pytester.makepyfile(
+        """
+        import asyncio
+        import aiohttp
+
+        def test_upload():
+            async def scenario():
+                form = aiohttp.FormData()
+                form.add_field("field", "value")
+                form.add_field("blob", {blob!r})
+                form.add_field("file", b"abc", filename="a.bin")
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        {url!r} + "/echo", data=form, timeout=5
+                    ) as response:
+                        await response.read()
+
+            asyncio.run(scenario())
+        """.format(url=http_server, blob=blob)
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "--capture-traffic", "--capture-max-inline-bytes=64"
+    )
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    params = {
+        item["name"]: item for item in request["postData"]["params"]
+    }
+    assert params["field"]["value"] == "value"
+    assert params["blob"]["value"] == ""
+    assert params["blob"]["_file"]
+    sidecar = (
+        pytester.path / "captured_traffic" / params["blob"]["_file"]
+    )
+    assert sidecar.read_bytes() == blob.encode("utf-8")

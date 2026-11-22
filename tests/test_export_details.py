@@ -186,6 +186,39 @@ def test_unsafe_multipart_field_name_stays_in_params():
     assert "_file" not in post_data
 
 
+def test_oversized_multipart_text_field_uses_sidecar():
+    saved = {}
+
+    def save_body(hint, data):
+        name = "bodies/{}_{}".format(len(saved), hint)
+        saved[name] = data
+        return name
+
+    request = RequestRecord(
+        method="POST",
+        url="http://example.test/upload",
+        headers=[("Content-Type", "multipart/form-data; boundary=b")],
+        parts=[
+            Part(
+                name="blob",
+                value=b"x" * 100,
+                content_type="text/plain; charset=utf-8",
+            )
+        ],
+    )
+
+    har = build_har(
+        [Exchange(request=request)], save_body=save_body, max_inline_bytes=10
+    )
+    param = har["log"]["entries"][0]["request"]["postData"]["params"][0]
+
+    assert param["name"] == "blob"
+    assert param["value"] == ""
+    assert param["_file"]
+    assert saved[param["_file"]] == b"x" * 100
+    assert "_truncated" not in param
+
+
 def test_gzip_response_records_wire_size(pytester, http_server, read_har):
     pytester.makepyfile(
         """

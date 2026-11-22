@@ -426,3 +426,41 @@ def test_requests_connection_error_is_marked_not_sent(
     entry = read_har(pytester)["log"]["entries"][0]
     assert entry["request"]["_not_sent"] is True
     assert "ConnectionError" in entry["_error"]
+
+
+def test_requests_multipart_text_field_respects_inline_cap(
+    pytester, http_server, read_har
+):
+    blob = "x" * 512
+
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_upload():
+            response = requests.post(
+                {url!r} + "/multipart",
+                data={{"field": "value"}},
+                files={{"blob": (None, {blob!r})}},
+                timeout=5,
+            )
+            assert response.status_code == 200
+        """.format(url=http_server, blob=blob)
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "--capture-traffic", "--capture-max-inline-bytes=64"
+    )
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    params = {
+        item["name"]: item for item in request["postData"]["params"]
+    }
+    assert params["field"]["value"] == "value"
+    assert params["blob"]["value"] == ""
+    assert params["blob"]["_file"]
+    sidecar = (
+        pytester.path / "captured_traffic" / params["blob"]["_file"]
+    )
+    assert sidecar.read_bytes() == blob.encode("utf-8")

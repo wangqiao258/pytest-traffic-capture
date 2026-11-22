@@ -262,9 +262,10 @@ def read_har():
 
 @pytest.fixture
 def closed_port():
-    """返回一个刚释放、预期无人监听的本地端口。"""
+    """返回一个绑定但未监听、因此连接会被拒绝的本地端口。"""
     sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    try:
+        sock.bind(("127.0.0.1", 0))
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()

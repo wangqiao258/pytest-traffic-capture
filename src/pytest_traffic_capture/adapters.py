@@ -809,14 +809,6 @@ def _make_requests_send(original):
 # --------------------------------------------------------------------------- #
 # httpx
 # --------------------------------------------------------------------------- #
-def _is_httpx_multipart(request) -> bool:
-    try:
-        content_type = request.headers.get("content-type", "")
-    except Exception:
-        return False
-    return "multipart/form-data" in str(content_type).lower()
-
-
 def _httpx_request_body(request) -> Tuple[Optional[bytes], bool]:
     """返回 ``(body, unreadable)``，不根据空的体进行猜测。"""
     try:
@@ -833,8 +825,109 @@ def _httpx_request_body(request) -> Tuple[Optional[bytes], bool]:
     return None, False
 
 
+def _httpx_content_length(request) -> Optional[int]:
+    try:
+        raw = request.headers.get("content-length")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+_TEE_SYNC_CLASS = None
+_TEE_ASYNC_CLASS = None
+
+
+def _tee_sync_stream(stream, collector: _BodyCollector):
+    """包装同步请求流：首次迭代收集字节，后续迭代原样透传。"""
+    global _TEE_SYNC_CLASS
+    if _TEE_SYNC_CLASS is None:
+        from httpx import SyncByteStream
+
+        class _TeeSyncStream(SyncByteStream):
+            def __init__(self, inner, body_collector) -> None:
+                self._inner = inner
+                self._collector = body_collector
+                self._started = False
+
+            def __iter__(self):
+                first = not self._started
+                self._started = True
+                if not first:
+                    yield from self._inner
+                    return
+                for chunk in self._inner:
+                    self._collector.append(chunk)
+                    yield chunk
+                self._collector.eof = True
+
+        _TEE_SYNC_CLASS = _TeeSyncStream
+    return _TEE_SYNC_CLASS(stream, collector)
+
+
+def _tee_async_stream(stream, collector: _BodyCollector):
+    """包装异步请求流：首次迭代收集字节，后续迭代原样透传。"""
+    global _TEE_ASYNC_CLASS
+    if _TEE_ASYNC_CLASS is None:
+        from httpx import AsyncByteStream
+
+        class _TeeAsyncStream(AsyncByteStream):
+            def __init__(self, inner, body_collector) -> None:
+                self._inner = inner
+                self._collector = body_collector
+                self._started = False
+
+            async def __aiter__(self):
+                first = not self._started
+                self._started = True
+                if not first:
+                    async for chunk in self._inner:
+                        yield chunk
+                    return
+                async for chunk in self._inner:
+                    self._collector.append(chunk)
+                    yield chunk
+                self._collector.eof = True
+
+        _TEE_ASYNC_CLASS = _TeeAsyncStream
+    return _TEE_ASYNC_CLASS(stream, collector)
+
+
+def _prepare_httpx_body(request, is_async: bool):
+    """返回 ``(snapshot, collector, expected, original_stream, wrapped_stream)``。
+
+    可读的体直接快照；流式/文件上传改用 tee，避免把整个上传读入内存，
+    同时保持 httpx 原有的流式与重放语义。
+    """
+    body, unreadable = _httpx_request_body(request)
+    if body is not None:
+        return _cap_bytes(body, _body_limit()), None, None, None, None
+    if not unreadable:
+        return _Snapshot(), None, None, None, None
+
+    stream = getattr(request, "stream", None)
+    if stream is None:
+        return _Snapshot(unreadable=True), None, None, None, None
+    collector = _BodyCollector(_body_limit())
+    expected = _httpx_content_length(request)
+    if is_async:
+        if not hasattr(stream, "__aiter__"):
+            return _Snapshot(unreadable=True), None, None, None, None
+        wrapped = _tee_async_stream(stream, collector)
+    else:
+        if not hasattr(stream, "__iter__"):
+            return _Snapshot(unreadable=True), None, None, None, None
+        wrapped = _tee_sync_stream(stream, collector)
+    request.stream = wrapped
+    return _Snapshot(), collector, expected, stream, wrapped
+
+
 def _request_from_httpx(
-    request, body: Optional[bytes] = None, unreadable: bool = False
+    request, snapshot: Optional[_Snapshot] = None
 ) -> RequestRecord:
     try:
         headers = [
@@ -842,56 +935,56 @@ def _request_from_httpx(
         ]
     except Exception:
         headers = [(str(key), str(value)) for key, value in request.headers.items()]
-    truncated = False
-    full_body_size = None
-    if body is not None:
-        snapshot = _cap_bytes(body, _body_limit())
-        body = snapshot.data
-        truncated = snapshot.truncated
-        full_body_size = snapshot.size if snapshot.truncated else None
+    if snapshot is None:
+        body, unreadable = _httpx_request_body(request)
+        if body is not None:
+            snapshot = _cap_bytes(body, _body_limit())
+        else:
+            snapshot = _Snapshot(unreadable=unreadable)
     return RequestRecord(
         method=request.method,
         url=str(request.url),
         headers=headers,
-        body=body,
-        unreadable=unreadable,
-        truncated=truncated,
-        full_body_size=full_body_size,
+        body=snapshot.data,
+        unreadable=snapshot.unreadable,
+        body_size=snapshot.size,
+        truncated=snapshot.truncated,
+        full_body_size=snapshot.size if snapshot.truncated else None,
     )
 
 
 def _httpx_request_record(
     hop_request,
     index: int,
-    first_body: Optional[bytes],
-    first_unreadable: bool,
+    first_snapshot: _Snapshot,
     http_version: Optional[str] = None,
 ) -> RequestRecord:
     if index == 0:
-        request = _request_from_httpx(hop_request, first_body, first_unreadable)
+        request = _request_from_httpx(hop_request, snapshot=first_snapshot)
     else:
         method = str(hop_request.method).upper()
         if method in ("GET", "HEAD") or (
-            first_body is None and not first_unreadable
+            first_snapshot.data is None and not first_snapshot.unreadable
         ):
-            request = _request_from_httpx(hop_request, None, False)
-        elif first_body is not None:
+            request = _request_from_httpx(hop_request, snapshot=_Snapshot())
+        elif first_snapshot.data is not None:
             # 307/308 保留原始方法和载荷。
-            request = _request_from_httpx(hop_request, first_body, False)
+            request = _request_from_httpx(hop_request, snapshot=first_snapshot)
         else:
-            request = _request_from_httpx(hop_request, None, True)
+            request = _request_from_httpx(
+                hop_request, snapshot=_Snapshot(unreadable=True)
+            )
     request.http_version = http_version or "HTTP/1.1"
     return request
 
 
 def _httpx_hop_request(
-    hop, index: int, first_body: Optional[bytes], first_unreadable: bool
+    hop, index: int, first_snapshot: _Snapshot
 ) -> RequestRecord:
     return _httpx_request_record(
         hop.request,
         index,
-        first_body,
-        first_unreadable,
+        first_snapshot,
         getattr(hop, "http_version", "HTTP/1.1") or "HTTP/1.1",
     )
 
@@ -909,15 +1002,16 @@ def _httpx_not_sent(exc: BaseException) -> bool:
         import httpx
     except Exception:
         return False
-    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+    return isinstance(
+        exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.StreamConsumed)
+    )
 
 
 def _record_httpx_error(
     recorder,
     hops,
     request,
-    first_body: Optional[bytes],
-    first_unreadable: bool,
+    first_snapshot: _Snapshot,
     started_at: datetime,
     elapsed_ms: float,
     exc: BaseException,
@@ -927,7 +1021,7 @@ def _record_httpx_error(
     not_sent = _httpx_not_sent(exc)
     if not hops:
         request_record = _request_from_httpx(
-            request, first_body, first_unreadable
+            request, snapshot=first_snapshot
         )
         if truncated or not_sent:
             # httpx 抛出 TooManyRedirects 时携带的是下一个请求，而它从未
@@ -950,8 +1044,7 @@ def _record_httpx_error(
         request_record = _httpx_request_record(
             hop_request,
             index,
-            first_body,
-            first_unreadable,
+            first_snapshot,
             (
                 getattr(hop_response, "http_version", "HTTP/1.1")
                 if hop_response is not None
@@ -1064,23 +1157,9 @@ def _make_httpx_send(original):
         if recorder is None or not recorder.is_capturing():
             return original(self, request, **kwargs)
 
-        # httpx 把 ``files=`` 载荷保存在 MultipartStream 中，无法通过
-        # ``request.content`` 读取。先将其物化：httpx 会用 ByteStream
-        # 替换该流，因此线上实际传输的字节相同。
-        if _is_httpx_multipart(request):
-            try:
-                request.read()
-            except Exception:
-                pass
-        first_body, first_unreadable = _httpx_request_body(request)
-        if first_unreadable:
-            # 类文件和生成器的上传同样存在于流中。提前读取它们
-            # 让我们能捕获字节，并保持回放可用。
-            try:
-                request.read()
-            except Exception:
-                pass
-            first_body, first_unreadable = _httpx_request_body(request)
+        first_snapshot, body_collector, expected, original_stream, wrapped = (
+            _prepare_httpx_body(request, is_async=False)
+        )
 
         started_at = datetime.now(timezone.utc)
         start = time.perf_counter()
@@ -1088,12 +1167,15 @@ def _make_httpx_send(original):
         try:
             response = original(self, request, **kwargs)
         except BaseException as exc:
+            if body_collector is not None:
+                first_snapshot = _snapshot_from_collector(
+                    body_collector, expected
+                )
             _record_httpx_error(
                 recorder,
                 _httpx_hops.get() or [],
                 request,
-                first_body,
-                first_unreadable,
+                first_snapshot,
                 started_at,
                 _elapsed_ms(start),
                 exc,
@@ -1101,20 +1183,23 @@ def _make_httpx_send(original):
             raise
         finally:
             _httpx_hops.reset(token)
+            if original_stream is not None and request.stream is wrapped:
+                request.stream = original_stream
+
+        if body_collector is not None:
+            first_snapshot = _snapshot_from_collector(body_collector, expected)
 
         elapsed = _elapsed_ms(start)
         stream = bool(kwargs.get("stream", False))
-        collector = None
+        response_collector = None
         if stream:
-            collector = _BodyCollector(_body_limit())
-            _install_httpx_stream_capture(response, collector)
+            response_collector = _BodyCollector(_body_limit())
+            _install_httpx_stream_capture(response, response_collector)
         hops = list(getattr(response, "history", None) or []) + [response]
         for index, hop in enumerate(hops):
             recorder.record(
                 Exchange(
-                    request=_httpx_hop_request(
-                        hop, index, first_body, first_unreadable
-                    ),
+                    request=_httpx_hop_request(hop, index, first_snapshot),
                     started_at=started_at,
                     # httpx 不暴露每跳的计时；只让最终响应获得测得的耗时，
                     # 而不是用整条重定向链的时间去夸大
@@ -1123,7 +1208,7 @@ def _make_httpx_send(original):
                     response=_response_from_httpx(
                         hop,
                         stream and hop is response,
-                        collector if hop is response else None,
+                        response_collector if hop is response else None,
                     ),
                 )
             )
@@ -1138,18 +1223,9 @@ def _make_httpx_async_send(original):
         if recorder is None or not recorder.is_capturing():
             return await original(self, request, **kwargs)
 
-        if _is_httpx_multipart(request):
-            try:
-                await request.aread()
-            except Exception:
-                pass
-        first_body, first_unreadable = _httpx_request_body(request)
-        if first_unreadable:
-            try:
-                await request.aread()
-            except Exception:
-                pass
-            first_body, first_unreadable = _httpx_request_body(request)
+        first_snapshot, body_collector, expected, original_stream, wrapped = (
+            _prepare_httpx_body(request, is_async=True)
+        )
 
         started_at = datetime.now(timezone.utc)
         start = time.perf_counter()
@@ -1157,12 +1233,15 @@ def _make_httpx_async_send(original):
         try:
             response = await original(self, request, **kwargs)
         except BaseException as exc:
+            if body_collector is not None:
+                first_snapshot = _snapshot_from_collector(
+                    body_collector, expected
+                )
             _record_httpx_error(
                 recorder,
                 _httpx_hops.get() or [],
                 request,
-                first_body,
-                first_unreadable,
+                first_snapshot,
                 started_at,
                 _elapsed_ms(start),
                 exc,
@@ -1170,20 +1249,23 @@ def _make_httpx_async_send(original):
             raise
         finally:
             _httpx_hops.reset(token)
+            if original_stream is not None and request.stream is wrapped:
+                request.stream = original_stream
+
+        if body_collector is not None:
+            first_snapshot = _snapshot_from_collector(body_collector, expected)
 
         elapsed = _elapsed_ms(start)
         stream = bool(kwargs.get("stream", False))
-        collector = None
+        response_collector = None
         if stream:
-            collector = _BodyCollector(_body_limit())
-            _install_httpx_async_stream_capture(response, collector)
+            response_collector = _BodyCollector(_body_limit())
+            _install_httpx_async_stream_capture(response, response_collector)
         hops = list(getattr(response, "history", None) or []) + [response]
         for index, hop in enumerate(hops):
             recorder.record(
                 Exchange(
-                    request=_httpx_hop_request(
-                        hop, index, first_body, first_unreadable
-                    ),
+                    request=_httpx_hop_request(hop, index, first_snapshot),
                     started_at=started_at,
                     # httpx 不暴露每跳的计时；只让最终响应获得测得的耗时，
                     # 而不是用整条重定向链的时间去夸大
@@ -1192,7 +1274,7 @@ def _make_httpx_async_send(original):
                     response=_response_from_httpx(
                         hop,
                         stream and hop is response,
-                        collector if hop is response else None,
+                        response_collector if hop is response else None,
                     ),
                 )
             )
@@ -1319,6 +1401,16 @@ def _aiohttp_part_content_type(value, charset: str) -> str:
     return "application/octet-stream"
 
 
+def _aiohttp_generated_body(data: bytes) -> _AiohttpPayload:
+    """按捕获上限描述插件自身生成的请求体。"""
+    snapshot = _cap_bytes(data, _body_limit())
+    return _AiohttpPayload(
+        body=snapshot.data,
+        truncated=snapshot.truncated,
+        size=snapshot.size,
+    )
+
+
 def _aiohttp_formdata_payload(data) -> _AiohttpPayload:
     """在不消费文件对象的情况下描述 aiohttp 的 ``FormData``。"""
     try:
@@ -1362,12 +1454,16 @@ def _aiohttp_formdata_payload(data) -> _AiohttpPayload:
                 body = snapshot.data
                 part_truncated = snapshot.truncated
                 part_size = snapshot.size if snapshot.truncated else None
-            elif isinstance(value, str):
-                body = value.encode(charset)
+            elif isinstance(value, (str, int, float)):
+                snapshot = _cap_bytes(str(value).encode(charset), _body_limit())
+                body = snapshot.data
+                part_truncated = snapshot.truncated
+                part_size = snapshot.size if snapshot.truncated else None
             elif isinstance(value, (bytes, bytearray, memoryview)):
-                body = bytes(value)
-            elif isinstance(value, (int, float)):
-                body = str(value).encode(charset)
+                snapshot = _cap_bytes(bytes(value), _body_limit())
+                body = snapshot.data
+                part_truncated = snapshot.truncated
+                part_size = snapshot.size if snapshot.truncated else None
             else:
                 size, source = _file_metadata(value)
                 return _AiohttpPayload(unreadable=True, size=size, source=source)
@@ -1395,8 +1491,8 @@ def _aiohttp_formdata_payload(data) -> _AiohttpPayload:
             return _AiohttpPayload(unreadable=True)
         pairs.append((type_options.get("name", ""), value))
     try:
-        return _AiohttpPayload(
-            body=urlencode(pairs, doseq=True, encoding=charset).encode()
+        return _aiohttp_generated_body(
+            urlencode(pairs, doseq=True, encoding=charset).encode()
         )
     except Exception:
         return _AiohttpPayload(unreadable=True)
@@ -1450,8 +1546,8 @@ def _aiohttp_payload(data) -> _AiohttpPayload:
             if not isinstance(value, (str, int, float)):
                 return _AiohttpPayload(unreadable=True)
         try:
-            return _AiohttpPayload(
-                body=urlencode(pairs, doseq=True).encode("utf-8")
+            return _aiohttp_generated_body(
+                urlencode(pairs, doseq=True).encode("utf-8")
             )
         except Exception:
             return _AiohttpPayload(unreadable=True)
@@ -1471,16 +1567,16 @@ def _aiohttp_payload(data) -> _AiohttpPayload:
             if not isinstance(value, (str, int, float)):
                 return _AiohttpPayload(unreadable=True)
         try:
-            return _AiohttpPayload(
-                body=urlencode(pairs, doseq=True).encode("utf-8")
+            return _aiohttp_generated_body(
+                urlencode(pairs, doseq=True).encode("utf-8")
             )
         except Exception:
             return _AiohttpPayload(unreadable=True)
 
     if isinstance(data, str):
-        return _AiohttpPayload(body=data.encode("utf-8"))
+        return _aiohttp_generated_body(data.encode("utf-8"))
     if isinstance(data, (bytes, bytearray, memoryview)):
-        return _AiohttpPayload(body=bytes(data))
+        return _aiohttp_generated_body(bytes(data))
     if hasattr(data, "read"):
         snapshot = _snapshot_file(data, limit=_body_limit())
         return _AiohttpPayload(
@@ -1497,8 +1593,8 @@ def _aiohttp_body_from_kwargs(kwargs) -> _AiohttpPayload:
     if kwargs.get("json") is not None:
         try:
             # 与 aiohttp 自身的序列化保持一致（json.dumps 默认值）。
-            return _AiohttpPayload(
-                body=json.dumps(kwargs["json"]).encode("utf-8")
+            return _aiohttp_generated_body(
+                json.dumps(kwargs["json"]).encode("utf-8")
             )
         except (TypeError, ValueError):
             return _AiohttpPayload(unreadable=True)

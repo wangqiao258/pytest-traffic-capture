@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 
+import httpx
+
 
 def test_httpx_file_upload_is_captured(
     pytester, http_server, read_har
@@ -147,7 +149,9 @@ def test_httpx_redirect_loop_records_history(pytester, http_server, read_har):
 
     result.assert_outcomes(passed=1)
     entries = read_har(pytester)["log"]["entries"]
-    assert len(entries) == 21
+    with httpx.Client() as client:
+        expected = client.max_redirects + 1
+    assert len(entries) == expected
     assert all(entry["response"]["status"] == 302 for entry in entries)
     assert "TooManyRedirects" in entries[-1]["_error"]
     assert entries[-1]["_redirects_truncated"] is True
@@ -179,7 +183,9 @@ def test_httpx_async_redirect_loop_records_history(
 
     result.assert_outcomes(passed=1)
     entries = read_har(pytester)["log"]["entries"]
-    assert len(entries) == 21
+    with httpx.Client() as client:
+        expected = client.max_redirects + 1
+    assert len(entries) == expected
     assert all(entry["response"]["status"] == 302 for entry in entries)
     assert "TooManyRedirects" in entries[-1]["_error"]
     assert entries[-1]["_redirects_truncated"] is True
@@ -325,3 +331,113 @@ def test_httpx_connection_error_is_marked_not_sent(
     entry = read_har(pytester)["log"]["entries"][0]
     assert entry["request"]["_not_sent"] is True
     assert "ConnectError" in entry["_error"]
+
+
+def test_httpx_streaming_upload_is_not_buffered(
+    pytester, http_server, read_har
+):
+    pytester.makepyfile(
+        """
+        import httpx
+
+        def test_upload():
+            def chunks():
+                yield b"abc"
+                yield b"defg"
+
+            request = httpx.Request(
+                "POST",
+                {url!r} + "/upload",
+                content=chunks(),
+                headers={{"Content-Type": "application/octet-stream"}},
+            )
+            with httpx.Client() as client:
+                response = client.send(request)
+            assert response.status_code == 200
+            assert not hasattr(request, "_content")
+            assert not isinstance(request.stream, httpx.ByteStream)
+
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    assert request["bodySize"] == 7
+    sidecar = (
+        pytester.path / "captured_traffic" / request["postData"]["_file"]
+    )
+    assert sidecar.read_bytes() == b"abcdefg"
+
+
+def test_httpx_multipart_upload_is_captured(pytester, http_server, read_har):
+    payload = b"httpx-multipart-payload"
+
+    pytester.makepyfile(
+        """
+        import httpx
+
+        def test_upload():
+            response = httpx.post(
+                {url!r} + "/upload",
+                files={{"file": ("a.bin", {payload!r})}},
+                timeout=5,
+            )
+            assert response.status_code == 200
+
+        """.format(url=http_server, payload=payload)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    params = {
+        item["name"]: item for item in request["postData"]["params"]
+    }
+    assert params["file"]["fileName"] == "a.bin"
+    assert params["file"]["_file"]
+    sidecar = (
+        pytester.path / "captured_traffic" / params["file"]["_file"]
+    )
+    assert sidecar.read_bytes() == payload
+
+
+def test_httpx_async_streaming_upload_is_captured(
+    pytester, http_server, read_har
+):
+    pytester.makepyfile(
+        """
+        import asyncio
+        import httpx
+
+        def test_upload():
+            async def chunks():
+                yield b"abc"
+                yield b"defg"
+
+            async def scenario():
+                async with httpx.AsyncClient() as client:
+                    request = httpx.Request(
+                        "POST",
+                        {url!r} + "/upload",
+                        content=chunks(),
+                        headers={{"Content-Type": "application/octet-stream"}},
+                    )
+                    response = await client.send(request)
+                assert response.status_code == 200
+
+            asyncio.run(scenario())
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    assert request["bodySize"] == 7
+    sidecar = (
+        pytester.path / "captured_traffic" / request["postData"]["_file"]
+    )
+    assert sidecar.read_bytes() == b"abcdefg"

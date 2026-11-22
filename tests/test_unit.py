@@ -10,13 +10,17 @@ from types import SimpleNamespace
 import pytest
 
 from pytest_traffic_capture.adapters import (
+    _aiohttp_body_from_kwargs,
     _aiohttp_not_sent,
     _aiohttp_payload,
     _BodyCollector,
+    _httpx_not_sent,
     _make_reader_readuntil,
     _request_from_requests,
     _requests_not_sent,
     _snapshot_file,
+    _tee_async_stream,
+    _tee_sync_stream,
     _TeeReader,
 )
 from pytest_traffic_capture.exporters import (
@@ -408,3 +412,104 @@ def test_sidecar_write_failure_does_not_raise(tmp_path, monkeypatch):
 
     with pytest.warns(RuntimeWarning):
         assert session.save_body("body.bin", b"payload") == ""
+
+
+def test_package_version_matches_metadata():
+    from importlib import metadata
+
+    from pytest_traffic_capture import __version__
+
+    try:
+        installed = metadata.version("pytest-traffic-capture")
+    except metadata.PackageNotFoundError:
+        pytest.skip("package is not installed")
+    assert __version__ == installed
+
+
+def test_aiohttp_generated_payloads_respect_body_limit(monkeypatch):
+    monkeypatch.setattr(
+        "pytest_traffic_capture.adapters._body_limit", lambda: 8
+    )
+
+    for payload in (
+        _aiohttp_payload("x" * 20),
+        _aiohttp_payload(b"x" * 20),
+        _aiohttp_payload({"blob": "x" * 20}),
+        _aiohttp_payload([("blob", "x" * 20)]),
+        _aiohttp_body_from_kwargs({"json": {"blob": "x" * 20}}),
+    ):
+        assert len(payload.body) == 8
+        assert payload.truncated is True
+        assert payload.size is not None and payload.size > 8
+
+
+def test_aiohttp_formdata_fields_respect_body_limit(monkeypatch, tmp_path):
+    aiohttp = pytest.importorskip("aiohttp")
+    monkeypatch.setattr(
+        "pytest_traffic_capture.adapters._body_limit", lambda: 8
+    )
+
+    path = tmp_path / "a.bin"
+    path.write_bytes(b"abcdefghij")
+    form = aiohttp.FormData()
+    form.add_field("blob", "x" * 20)
+    with open(path, "rb") as handle:
+        form.add_field("file", handle, filename="a.bin")
+        payload = _aiohttp_payload(form)
+
+    assert payload.parts is not None
+    blob, file_part = payload.parts
+    assert blob.value == b"x" * 8
+    assert blob.truncated is True
+    assert blob.size == 20
+    assert file_part.value == b"abcdefgh"
+    assert file_part.truncated is True
+    assert file_part.size == 10
+    assert payload.truncated is True
+
+
+def test_httpx_stream_consumed_is_treated_as_not_sent():
+    httpx = pytest.importorskip("httpx")
+
+    assert _httpx_not_sent(httpx.StreamConsumed()) is True
+    assert _httpx_not_sent(RuntimeError("boom")) is False
+
+
+def test_httpx_tee_stream_captures_first_pass_only():
+    pytest.importorskip("httpx")
+
+    class _Replay:
+        def __iter__(self):
+            yield b"ab"
+            yield b"cd"
+
+    collector = _BodyCollector()
+    tee = _tee_sync_stream(_Replay(), collector)
+
+    assert b"".join(tee) == b"abcd"
+    assert b"".join(tee) == b"abcd"
+    assert collector.eof is True
+    assert b"".join(collector.chunks) == b"abcd"
+
+
+def test_httpx_async_tee_stream_captures_first_pass_only():
+    pytest.importorskip("httpx")
+
+    class _Replay:
+        async def __aiter__(self):
+            for chunk in (b"ab", b"cd"):
+                yield chunk
+
+    collector = _BodyCollector()
+
+    async def consume():
+        tee = _tee_async_stream(_Replay(), collector)
+        first = b"".join([chunk async for chunk in tee])
+        second = b"".join([chunk async for chunk in tee])
+        return first, second
+
+    first, second = asyncio.run(consume())
+
+    assert first == second == b"abcd"
+    assert collector.eof is True
+    assert b"".join(collector.chunks) == b"abcd"

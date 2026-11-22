@@ -180,7 +180,9 @@ def _raw_sidecar(
     return _save_body_file(save_body, "body", None, body, mime_type)
 
 
-def _field_item(part, save_body: Optional[SaveBody]) -> dict:
+def _field_item(
+    part, save_body: Optional[SaveBody], max_inline_bytes: int = 0
+) -> dict:
     """描述一个非文件的 multipart 字段，且不丢失原始字节。"""
     raw = part.value
     text = raw.decode("utf-8", "replace")
@@ -191,13 +193,21 @@ def _field_item(part, save_body: Optional[SaveBody]) -> dict:
         item["_truncated"] = True
         if part.size is not None:
             item["_size"] = part.size
+    oversized = bool(
+        max_inline_bytes
+        and max_inline_bytes > 0
+        and len(raw) > max_inline_bytes
+    )
     needs_sidecar = raw != text.encode("utf-8")
-    if save_body is not None and needs_sidecar:
+    if save_body is not None and (needs_sidecar or oversized):
         rel = _save_body_file(
             save_body, part.name, None, raw, part.content_type or ""
         )
         if rel:
             item["_file"] = rel
+            if oversized:
+                # 字段值本身完整保存在 sidecar 中；HAR 内不再重复内联。
+                item["value"] = ""
     return item
 
 
@@ -248,7 +258,7 @@ def _analyze_request(
                         item["_size"] = part.size
                 params.append(item)
             else:
-                params.append(_field_item(part, save_body))
+                params.append(_field_item(part, save_body, max_inline_bytes))
         # aiohttp 在 ClientRequest 构建载荷后报告编码后的 multipart 大小；
         # 当大小无法测量时回退为 -1。
         return BodyAnalysis(
@@ -291,7 +301,7 @@ def _analyze_request(
                             item["_size"] = part.size
                     params.append(item)
                 else:
-                    params.append(_field_item(part, save_body))
+                    params.append(_field_item(part, save_body, max_inline_bytes))
             return BodyAnalysis(
                 kind="multipart", mime_type=mime_type, params=params, size=size
             )

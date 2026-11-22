@@ -4,17 +4,6 @@ pytest-traffic-capture
 在 pytest 运行期间捕获 ``requests``、``httpx`` 和 ``aiohttp`` 的流量，并将其写为
 HAR 1.2 文档。
 
-功能特性
---------
-
-* 捕获使用 ``requests``、``httpx`` （同步和异步）以及 ``aiohttp`` 进行的 HTTP
-  交换。
-* 每个测试写入一个 ``.har`` 文件。
-* 将较大的 body 移到 sidecar 文件，而不是撑大 HAR 文档。
-* 当调用方通过普通的 ``read``/``iter_content``/``iter_bytes`` API 消费 streaming
-  响应时，惰性地记录它们。
-* 对 307/308 重定向跳转复用捕获的负载，使每一跳都保留原始字节。
-
 环境要求
 ------------
 
@@ -79,37 +68,11 @@ HAR 1.2 文档。
    不支持将其指向项目根目录（``.``）或包含真实测试的目录。产物名称以 ``traffic_``
    开头，因此不会匹配 doctest 默认的 ``test*.txt`` glob。
 
-HAR 文件可以导入 Chrome DevTools 的 Network 面板，也可以导入 Postman 等工具。
-名称以 ``_`` 开头的字段（例如
-``_file``、``_streaming``、``_truncated``、``_redirects_truncated`` 和
-``_headers_synthesized``）是用于 sidecar 引用和捕获元数据的
-HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中的 body 通过 ``_file``
-引用，浏览器 HAR 查看器不会显示它们；请打开 sidecar 文件来查看。
-
-有意设计
--------------
-
-以下行为是刻意采用的保守策略，用于如实反映线上流量，不是缺陷：
-
-* ``requests`` 的生成器和不可 seek 的流式上传会在客户端消费时通过 tee 捕获。如果
-  客户端提前停止，捕获的 body 会标记 ``_truncated``，产物不完整；此时线上确实没有
-  发出完整字节。
-* aiohttp 错误条目会重建 aiohttp 自动添加的头（``Accept``、``Accept-Encoding``、
-  ``User-Agent``、``Host`` 和 cookies），并标记 ``_headers_synthesized``。
-
 已知限制
 -----------------
 
-* streaming body 通过普通的 ``read`` 和字节迭代器 API 收集。直接使用 httpx 的
-  ``iter_raw()`` 或 ``requests`` 的 ``response.raw`` 会绕过收集。
-* requests、httpx 和 aiohttp 的重定向链都会被记录。无法完成的链会标记
-  ``_redirects_truncated``；从未到达传输层的请求会标记 ``_not_sent``。
-* aiohttp 在传输时会对 multipart 文件名进行百分号编码；HAR 保留解码后的
-  ``fileName`` 以便阅读。
-* 当 aiohttp 在生成的请求上暴露编码后的 ``bodySize`` 时，aiohttp ``FormData``
-  请求会报告实测的编码 ``bodySize``；否则回退为 ``-1``。
-* 从 ``requests`` 响应钩子发起的嵌套请求会被捕获；重定向跳转由外层调用记录一次。
-  显式传入 ``allow_redirects=False`` 的嵌套请求与重定向跳转无法区分，不会单独记录。
+* 直接使用 httpx 的 ``iter_raw()`` 或 ``requests`` 的 ``response.raw`` 会绕过收集。
+* 显式传入 ``allow_redirects=False`` 的嵌套请求与重定向跳转无法区分，不会单独记录。
 * HAR ``timings`` 将实测总时长报告为 ``wait``：requests、httpx 和 aiohttp 都不暴露
   首字节时间或传输时长。httpx/aiohttp 记录的重定向跳转共享相同的起始时间，只有最后
   一跳携带实测时长。
@@ -134,9 +97,6 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
 
     pip install tox
     tox
-
-测试套件包含一个本地 HTTP 服务器以及重定向/上传/下载场景。``aiohttp39`` 环境用于
-检查与 aiohttp 3.9 的兼容性。
 
 许可证
 -------
