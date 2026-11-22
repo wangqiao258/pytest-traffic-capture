@@ -63,7 +63,7 @@ HAR 1.2 文档以及可重放的 cURL 命令。
     [pytest]
     capture_traffic_dir = captured_traffic
     capture_traffic_max_inline_bytes = 1048576
-    capture_traffic_max_body_bytes = 0
+    capture_traffic_max_body_bytes = 5242880
 
 输出
 ------
@@ -80,8 +80,7 @@ HAR 1.2 文档以及可重放的 cURL 命令。
    只要安装了本插件，捕获目录就会被排除在 pytest 收集之外，即使没有传入
    ``--capture-traffic`` 也是如此。请为 ``--capture-dir`` 使用一个专用的子目录：
    不支持将其指向项目根目录（``.``）或包含真实测试的目录。产物名称以 ``traffic_``
-   开头，因此不会匹配 doctest 默认的 ``test*.txt`` glob。旧版本遗留的产物会保留其
-   旧名称；升级后请删除一次。
+   开头，因此不会匹配 doctest 默认的 ``test*.txt`` glob。
 
 HAR 文件可以导入 Chrome DevTools 的 Network 面板。名称以 ``_`` 开头的字段（例如
 ``_file``、``_streaming``、``_truncated``、``_redirects_truncated``、
@@ -91,6 +90,23 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
 
 ``.curl.txt`` 中的命令使用 POSIX shell 语法（bash/zsh/Git Bash），并通过生成它们的
 机器上的绝对路径来引用 sidecar body。在 WSL 上，重放前请用 ``wslpath`` 改写这些路径。
+
+有意设计
+-------------
+
+以下行为是刻意采用的保守策略，用于如实反映线上流量，不是缺陷：
+
+* ``requests`` 的生成器和不可 seek 的流式上传会在客户端消费时通过 tee 捕获。如果
+  客户端提前停止，捕获的 body 会标记 ``_truncated``，重放不完整；此时线上确实没有
+  发出完整字节。
+* 包含 ``=``、``;``、引号或控制字符的 multipart 字段名无法通过 curl 的 ``-F``
+  表达；这些请求改用原始 multipart body 和原始 ``Content-Type`` 头来重放。
+* curl 在重放时会规范化 multipart Content-Type 参数值（例如 ``charset="utf-8"``）；
+  HAR 保留完全一致的头。
+* 生成的 cURL 命令会为捕获的 body 省略 ``Content-Length``，以便 curl 重新计算它。
+  没有 body 的请求可能仍保留 ``Content-Length: 0``。
+* aiohttp 错误条目会重建 aiohttp 自动添加的头（``Accept``、``Accept-Encoding``、
+  ``User-Agent``、``Host`` 和 cookies），并标记 ``_headers_synthesized``。
 
 已知限制
 -----------------
@@ -104,21 +120,13 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
   传输形式。
 * 当 aiohttp 在生成的请求上暴露编码后的 ``bodySize`` 时，aiohttp ``FormData``
   请求会报告实测的编码 ``bodySize``；否则回退为 ``-1``。
-* ``requests`` 的生成器和不可 seek 的流式上传会在客户端消费时通过 tee 捕获。如果
-  客户端提前停止，捕获的 body 会标记 ``_truncated``，重放不完整。
 * 从 ``requests`` 响应钩子发起的嵌套请求会被捕获；重定向跳转由外层调用记录一次。
   显式传入 ``allow_redirects=False`` 的嵌套请求与重定向跳转无法区分，不会单独记录。
-* 包含 ``=``、``;``、引号或控制字符的 multipart 字段名无法通过 curl 的 ``-F``
-  表达；这些请求改用原始 multipart body 和原始 ``Content-Type`` 头来重放。
-* curl 在重放时会规范化 multipart Content-Type 参数值（例如 ``charset="utf-8"``）；
-  HAR 保留完全一致的头。
 * 非 ASCII 请求 body 和表单字段通过 sidecar 文件重放。从 Git Bash 调用时，原生
   Windows ``curl`` 仍可能对非 ASCII 的 sidecar 路径或 multipart 文件名编码错误；
   请优先使用 ASCII 捕获目录，或设置 ``MSYS2_ARG_CONV_EXCL='*'``。
 * 在 Windows Git Bash 上，MSYS 路径转换可能改写看起来像 POSIX 路径的参数（例如
   ``@/etc/passwd``）；重放此类捕获命令时请设置 ``MSYS2_ARG_CONV_EXCL='*'``。
-* 生成的 cURL 命令会为捕获的 body 省略 ``Content-Length``，以便 curl 重新计算它。
-  没有 body 的请求可能仍保留 ``Content-Length: 0``。
 * HAR ``timings`` 将实测总时长报告为 ``wait``：requests、httpx 和 aiohttp 都不暴露
   首字节时间或传输时长。httpx/aiohttp 记录的重定向跳转共享相同的起始时间，只有最后
   一跳携带实测时长。
@@ -129,8 +137,6 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
   仍会收到完整 body，但产物会被标记为截断，cURL 重放不完整。非流式调用（例如
   ``requests.get`` 不开 ``stream=True``）的内存开销由 HTTP 库本身决定，本插件无法
   降低。截断时终端摘要会提示被截断的 body 数量。
-* aiohttp 错误条目会重建 aiohttp 自动添加的头（``Accept``、``Accept-Encoding``、
-  ``User-Agent``、``Host`` 和 cookies），并标记 ``_headers_synthesized``。
 
 .. warning::
 
