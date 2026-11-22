@@ -16,7 +16,7 @@ def _aiohttp_version():
     return tuple(int(part) for part in parts[:2])
 
 
-def test_aiohttp_307_preserves_body(pytester, http_server, read_har, read_curl):
+def test_aiohttp_307_preserves_body(pytester, http_server, read_har):
     pytester.makepyfile(
         """
         import asyncio
@@ -44,7 +44,6 @@ def test_aiohttp_307_preserves_body(pytester, http_server, read_har, read_curl):
     post = entries[1]["request"]["postData"]
     sidecar = pytester.path / "captured_traffic" / post["_file"]
     assert sidecar.read_bytes() == b"abc"
-    assert "--data-binary '@" in read_curl(pytester)
 
 
 def test_aiohttp_readline_and_readuntil_still_work(
@@ -165,7 +164,7 @@ def test_aiohttp_readexactly_is_collected(pytester, http_server, read_har):
 
 
 def test_aiohttp_file_upload_is_captured(
-    pytester, http_server, read_har, read_curl
+    pytester, http_server, read_har
 ):
     payload = b"file-bytes" * 1024
     upload = pytester.path / "upload.bin"
@@ -207,11 +206,10 @@ def test_aiohttp_file_upload_is_captured(
     assert params["file"]["fileName"] == "upload.bin"
     sidecar = pytester.path / "captured_traffic" / params["file"]["_file"]
     assert sidecar.read_bytes() == payload
-    assert "-F 'file=@" in read_curl(pytester)
 
 
 def test_aiohttp_dict_bytes_is_captured_as_multipart(
-    pytester, http_server, read_har, read_curl
+    pytester, http_server, read_har
 ):
     pytester.makepyfile(
         """
@@ -245,10 +243,9 @@ def test_aiohttp_dict_bytes_is_captured_as_multipart(
     assert params[0]["fileName"] == "raw"
     sidecar = pytester.path / "captured_traffic" / params[0]["_file"]
     assert sidecar.read_bytes() == b"\xff\xfe"
-    assert "-F 'raw=@" in read_curl(pytester)
 
 
-def test_aiohttp_pair_list_is_captured(pytester, http_server, read_har, read_curl):
+def test_aiohttp_pair_list_is_captured(pytester, http_server, read_har):
     pytester.makepyfile(
         """
         import asyncio
@@ -278,7 +275,6 @@ def test_aiohttp_pair_list_is_captured(pytester, http_server, read_har, read_cur
         ("a", "1"),
         ("a", "2"),
     ]
-    assert "--data-raw 'a=1&a=2'" in read_curl(pytester)
 
 
 def test_aiohttp_callable_raise_for_status_records_response(
@@ -432,8 +428,8 @@ def test_aiohttp_formdata_body_size_is_exact(
     assert entry["request"]["bodySize"] == expected
 
 
-def test_aiohttp_wire_filename_is_preserved(
-    pytester, http_server, read_har, read_curl
+def test_aiohttp_unicode_filename_is_decoded(
+    pytester, http_server, read_har
 ):
     pytester.makepyfile(
         """
@@ -454,6 +450,7 @@ def test_aiohttp_wire_filename_is_preserved(
                         {url!r} + "/multipart", data=form, timeout=5
                     ) as response:
                         payload = await response.json()
+                # aiohttp 在线上对文件名做百分号编码。
                 assert payload["parts"][0]["filename"] == (
                     "%E6%96%87%E4%BB%B6.txt"
                 )
@@ -469,8 +466,6 @@ def test_aiohttp_wire_filename_is_preserved(
     params = entry["request"]["postData"]["params"]
     file_param = next(item for item in params if item.get("fileName"))
     assert file_param["fileName"] == "文件.txt"
-    assert file_param["_wireFileName"] == "%E6%96%87%E4%BB%B6.txt"
-    assert "filename=%E6%96%87%E4%BB%B6.txt" in read_curl(pytester)
 
 
 def test_aiohttp_streaming_response_cap(pytester, http_server, read_har):

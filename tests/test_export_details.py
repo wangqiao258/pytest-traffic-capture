@@ -1,4 +1,4 @@
-"""针对响应编码与重定向的 HAR/cURL 保真度测试。"""
+"""针对响应编码与重定向的 HAR 保真度测试。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import base64
 
 import pytest
 
-from pytest_traffic_capture.exporters import build_curl, build_har
+from pytest_traffic_capture.exporters import build_har
 from pytest_traffic_capture.model import Exchange, RequestRecord, ResponseRecord
 from pytest_traffic_capture.multipart import Part
 
@@ -78,7 +78,7 @@ def test_har_preserves_content_type_parameters():
     assert entry["response"]["content"]["mimeType"] == "text/html; charset=utf-8"
 
 
-def test_multipart_metadata_and_raw_fields(tmp_path):
+def test_multipart_metadata_and_raw_fields():
     request = RequestRecord(
         method="POST",
         url="http://example.test/upload",
@@ -117,23 +117,12 @@ def test_multipart_metadata_and_raw_fields(tmp_path):
 
     assert params["jsonfield"]["value"] == '{"a": 1}'
     assert params["jsonfield"]["contentType"] == "application/json"
-    assert params["jsonfield"]["_file"]
+    assert "_file" not in params["jsonfield"]
     assert params["binfield"]["value"] == "\ufffd\ufffd\x00binary"
     assert params["binfield"]["_file"]
     assert params["note"]["fileName"] == "note.txt"
     assert params["note"]["contentType"] == "text/plain; charset=utf-8"
-
-    curl = build_curl(
-        [Exchange(request=request)], save_body=save_body, body_path_base=tmp_path
-    )
-
-    assert "-H 'Content-Length" not in curl
-    assert "-F 'jsonfield=<" in curl
-    assert ";type=application/json" in curl
-    assert "-F 'binfield=<" in curl
-    assert "-F 'note=@" in curl
-    assert ';headers="Content-Type: text/plain; charset=utf-8"' in curl
-    assert ";filename=note.txt" in curl
+    assert params["note"]["_file"]
 
 
 def test_max_inline_zero_keeps_text_inline_but_sidecars_binary():
@@ -169,69 +158,7 @@ def test_max_inline_zero_keeps_text_inline_but_sidecars_binary():
     assert list(saved.values()) == [b"\x00\x01"]
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        "中文请求体".encode("utf-8"),
-        b"abc\x00def",
-    ],
-)
-def test_curl_uses_sidecar_for_unsafe_text(tmp_path, body):
-    request = RequestRecord(
-        method="POST",
-        url="http://example.test/echo",
-        headers=[
-            ("Content-Type", "text/plain; charset=utf-8"),
-            ("Content-Length", str(len(body))),
-        ],
-        body=body,
-    )
-    saved = {}
-
-    def save_body(hint, data):
-        name = "bodies/{}_{}".format(len(saved), hint)
-        saved[name] = data
-        return name
-
-    curl = build_curl(
-        [Exchange(request=request)], save_body=save_body, body_path_base=tmp_path
-    )
-
-    assert list(saved.values()) == [body]
-    assert "--data-binary '@" in curl
-    assert "--data-raw" not in curl
-    assert "-H 'Content-Length" not in curl
-
-
-def test_multiline_text_body_uses_sidecar(tmp_path):
-    body = b"first line\n>>> assert 1 == 2\nlast line"
-    request = RequestRecord(
-        method="POST",
-        url="http://example.test/echo",
-        headers=[
-            ("Content-Type", "text/plain; charset=utf-8"),
-            ("Content-Length", str(len(body))),
-        ],
-        body=body,
-    )
-    saved = {}
-
-    def save_body(hint, data):
-        name = "bodies/{}_{}".format(len(saved), hint)
-        saved[name] = data
-        return name
-
-    curl = build_curl(
-        [Exchange(request=request)], save_body=save_body, body_path_base=tmp_path
-    )
-
-    assert list(saved.values()) == [body]
-    assert "--data-binary '@" in curl
-    assert "--data-raw" not in curl
-    assert ">>>" not in curl
-
-
-def test_unsafe_multipart_field_name_uses_raw_body(tmp_path):
+def test_unsafe_multipart_field_name_stays_in_params():
     body = (
         b"--b\r\n"
         b'Content-Disposition: form-data; name="a=b"\r\n'
@@ -248,27 +175,15 @@ def test_unsafe_multipart_field_name_uses_raw_body(tmp_path):
         ],
         body=body,
     )
-    saved = {}
 
-    def save_body(hint, data):
-        name = "bodies/{}_{}".format(len(saved), hint)
-        saved[name] = data
-        return name
+    har = build_har([Exchange(request=request)])
 
-    curl = build_curl(
-        [Exchange(request=request)], save_body=save_body, body_path_base=tmp_path
-    )
-
-    assert list(saved.values()) == [body]
-    assert "--data-binary '@" in curl
-    assert "-F " not in curl
-    assert "Content-Type: multipart/form-data; boundary=b" in curl
-    assert "not curl-safe" in curl
-
-    har = build_har([Exchange(request=request)], save_body=save_body)
     post_data = har["log"]["entries"][0]["request"]["postData"]
-    assert post_data["_file"]
-    assert saved[post_data["_file"]] == body
+    assert post_data["mimeType"] == "multipart/form-data; boundary=b"
+    assert [(item["name"], item["value"]) for item in post_data["params"]] == [
+        ("a=b", "value")
+    ]
+    assert "_file" not in post_data
 
 
 def test_gzip_response_records_wire_size(pytester, http_server, read_har):

@@ -1,14 +1,13 @@
-"""将捕获的交换渲染为 HAR 1.2 文档与 cURL 命令列表。"""
+"""将捕获的交换渲染为 HAR 1.2 文档。"""
 
 from __future__ import annotations
 
 import base64
-import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from . import __version__, multipart
@@ -53,14 +52,6 @@ _EXT_BY_MIME = {
     "text/plain": ".txt",
     "text/html": ".html",
 }
-
-# RFC 7230 token(tchar)。注意 '|' 和 '`' 是合法的 token 字符，
-# 但仍是 shell 元字符，因此 method 也必须做 shell 转义。
-_METHOD_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-
-# curl 在第一个 '=' 处解析 ``-F name=value``，并把 ';' 当作选项
-# 分隔符，因此这些字符无法通过 -F 表达。
-_CURL_UNSAFE_FORM_NAME = re.compile(r'[\x00-\x1f\x7f=;,"]')
 
 
 @dataclass
@@ -123,25 +114,6 @@ def _ext_for_mime(mime_type: str) -> str:
     return _EXT_BY_MIME.get(_split_mime(mime_type), ".bin")
 
 
-def _has_non_ascii(value: str) -> bool:
-    return any(ord(character) > 127 for character in str(value))
-
-
-def _argv_safe(text: str) -> bool:
-    """当把 *text* 嵌入原生 argv 会有损时返回 False。"""
-    return (
-        "\x00" not in text
-        and "\n" not in text
-        and "\r" not in text
-        and text.isascii()
-    )
-
-
-def _curl_form_name_safe(name) -> bool:
-    value = str(name)
-    return bool(value) and not _CURL_UNSAFE_FORM_NAME.search(value)
-
-
 def _save_body_file(
     save_body: Optional[SaveBody],
     field_name: str,
@@ -196,14 +168,14 @@ def _raw_sidecar(
     save_body: Optional[SaveBody],
     mime_type: str,
 ) -> str:
-    """当解码后的文本无法逐字回放时，保存原始字节。"""
+    """当解码后的文本与原始字节不一致时，保存原始字节。"""
     if save_body is None:
         return ""
     try:
         changed = body != text.encode("utf-8")
     except Exception:
         changed = True
-    if not changed and _argv_safe(text):
+    if not changed:
         return ""
     return _save_body_file(save_body, "body", None, body, mime_type)
 
@@ -219,12 +191,7 @@ def _field_item(part, save_body: Optional[SaveBody]) -> dict:
         item["_truncated"] = True
         if part.size is not None:
             item["_size"] = part.size
-    needs_sidecar = (
-        bool(part.content_type)
-        or not _argv_safe(text)
-        or raw != text.encode("utf-8")
-        or text.startswith(("@", "<"))
-    )
+    needs_sidecar = raw != text.encode("utf-8")
     if save_body is not None and needs_sidecar:
         rel = _save_body_file(
             save_body, part.name, None, raw, part.content_type or ""
@@ -273,11 +240,6 @@ def _analyze_request(
                     "fileName": part.filename,
                     "contentType": part.content_type or "application/octet-stream",
                 }
-                if getattr(part, "wire_filename", None) not in (
-                    None,
-                    part.filename,
-                ):
-                    item["_wireFileName"] = part.wire_filename
                 if rel:
                     item["_file"] = rel
                 if getattr(part, "truncated", False):
@@ -321,11 +283,6 @@ def _analyze_request(
                         "fileName": part.filename,
                         "contentType": part.content_type or "application/octet-stream",
                     }
-                    if getattr(part, "wire_filename", None) not in (
-                        None,
-                        part.filename,
-                    ):
-                        item["_wireFileName"] = part.wire_filename
                     if rel:
                         item["_file"] = rel
                     if getattr(part, "truncated", False):
@@ -335,16 +292,9 @@ def _analyze_request(
                     params.append(item)
                 else:
                     params.append(_field_item(part, save_body))
-            analysis = BodyAnalysis(
+            return BodyAnalysis(
                 kind="multipart", mime_type=mime_type, params=params, size=size
             )
-            if any(not _curl_form_name_safe(part.name) for part in parts):
-                # curl 无法表达包含 '='、';'、引号或控制字符的名称；
-                # 保留原始体以便字节精确回放。
-                analysis.raw_file = _save_body_file(
-                    save_body, "body", None, body, mime_type
-                )
-            return analysis
 
     if _split_mime(mime_type) == "application/x-www-form-urlencoded":
         oversized = _oversized_body(
@@ -482,8 +432,6 @@ def _request_entry(
             "mimeType": mime_type,
             "params": analysis.params,
         }
-        if analysis.raw_file:
-            entry["postData"]["_file"] = analysis.raw_file
     elif analysis.kind == "binary":
         if analysis.file:
             entry["postData"] = {
@@ -696,267 +644,3 @@ def build_har(
             "entries": entries,
         }
     }
-
-
-def _shell_quote(value: str) -> str:
-    return "'" + str(value).replace("'", "'\\''") + "'"
-
-
-def _curl_quoted(value: str) -> str:
-    """当 curl ``-F`` 参数包含分隔符时对其进行转义。"""
-    value = str(value)
-    if any(character in value for character in ';,"'):
-        value = '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return value
-
-
-def _curl_filename(filename: str) -> str:
-    """为 ``curl -F`` 转义 multipart 文件名。"""
-    return _curl_quoted(filename)
-
-
-def _curl_type(content_type: str) -> str:
-    """为 ``-F`` 转义 multipart Content-Type（含其参数）。"""
-    return _curl_quoted(content_type)
-
-
-def _curl_content_type_spec(content_type: str) -> Tuple[str, bool]:
-    """返回 *content_type* 对应的 ``-F`` 后缀，以及它是否被规范化。
-
-    curl 的 ``;type=`` 解析器按 ``;`` 拆分，因此会丢弃诸如
-    ``charset`` 之类的参数。``;headers=`` 会保留它们，但 curl 会通过
-    给参数值加引号来规范化它们（``charset="utf-8"``）。
-    """
-    if ";" in content_type or "," in content_type:
-        value = "Content-Type: {}".format(content_type)
-        value = value.replace("\\", "\\\\").replace('"', '\\"')
-        return ';headers="{}"'.format(value), True
-    return ";type=" + _curl_type(content_type), False
-
-
-def _body_reference(relative: str, base: Optional[Path]) -> str:
-    """返回一个可从任意工作目录使用的旁挂文件(sidecar)路径。"""
-    if not relative:
-        return ""
-    if base is None:
-        return relative
-    return (Path(base) / relative).resolve().as_posix()
-
-
-def build_curl(
-    exchanges: Sequence[Exchange],
-    *,
-    save_body: Optional[SaveBody] = None,
-    max_inline_bytes: int = 0,
-    body_path_base: Optional[Path] = None,
-) -> str:
-    blocks: List[str] = []
-    for index, exchange in enumerate(exchanges, start=1):
-        request = exchange.request
-        status = exchange.response.status if exchange.response is not None else "ERROR"
-        analysis = analyze_request(request, save_body, max_inline_bytes)
-
-        headers = list(request.headers)
-        original_has_content_type = any(
-            str(key).lower() == "content-type" for key, _ in request.headers
-        )
-        has_body = analysis.kind not in ("none", "unreadable") and not (
-            analysis.kind == "binary" and not analysis.file
-        )
-        uncaptured = analysis.kind == "unreadable" or (
-            analysis.kind == "binary" and not analysis.file
-        )
-        if has_body or uncaptured:
-            filtered = []
-            for key, value in headers:
-                lower = str(key).lower()
-                if lower == "content-length":
-                    continue
-                if uncaptured and lower == "transfer-encoding":
-                    continue
-                if (
-                    analysis.kind == "multipart"
-                    and not analysis.raw_file
-                    and lower == "content-type"
-                    and "boundary=" in str(value).lower()
-                ):
-                    continue
-                filtered.append((key, value))
-            headers = filtered
-
-        parts: List[str] = ["curl"]
-        warnings: List[str] = []
-        if request.truncated:
-            warnings.append(
-                "# WARNING: request body was truncated; replay is incomplete"
-            )
-        method = str(request.method or "")
-        method_upper = method.upper()
-        method_is_token = bool(_METHOD_TOKEN.fullmatch(method_upper))
-        if _has_non_ascii(request.url):
-            warnings.append(
-                "# WARNING: URL contains non-ASCII characters; "
-                "Windows curl may mis-encode it"
-            )
-        for key, value in headers:
-            if _has_non_ascii(value):
-                warnings.append(
-                    "# WARNING: header {!r} contains non-ASCII characters; "
-                    "Windows curl may mis-encode it".format(key)
-                )
-        if not method_is_token:
-            warnings.append(
-                "# WARNING: invalid HTTP method {!r}; command not replayable".format(
-                    method
-                )
-            )
-        elif method_upper == "HEAD" and not has_body:
-            parts.append("--head")
-        elif method_upper != "GET" or has_body:
-            # 没有显式的 -X 时，--data-* 会把 GET 变成 POST。
-            # 对 method 做转义：像 '|' 和 '`' 这样的 token 字符仍是
-            # shell 元字符。
-            parts.append("-X " + _shell_quote(method_upper))
-        for key, value in headers:
-            parts.append("-H " + _shell_quote("{}: {}".format(key, value)))
-
-        if analysis.kind == "multipart":
-            if analysis.raw_file:
-                # 字段名包含 curl 无法通过 -F 表达的字符；
-                # 改为回放精确的 multipart 体。
-                reference = _body_reference(analysis.raw_file, body_path_base)
-                if _has_non_ascii(reference):
-                    warnings.append(
-                        "# WARNING: sidecar path {!r} contains non-ASCII "
-                        "characters; Windows curl may mis-encode it".format(
-                            reference
-                        )
-                    )
-                warnings.append(
-                    "# NOTE: multipart field names are not curl-safe; "
-                    "replaying the raw body"
-                )
-                parts.append("--data-binary " + _shell_quote("@" + reference))
-            else:
-                normalized_note = False
-                for param in analysis.params:
-                    if param.get("_unreadable"):
-                        warnings.append(
-                            "# WARNING: multipart field {!r} was not captured".format(
-                                param["name"]
-                            )
-                        )
-                        continue
-                    if not _curl_form_name_safe(param.get("name")):
-                        warnings.append(
-                            "# WARNING: multipart field name {!r} cannot be "
-                            "reproduced by curl; field omitted".format(
-                                param.get("name")
-                            )
-                        )
-                        continue
-                    if "_file" in param:
-                        content_type = param.get("contentType") or ""
-                        reference = _body_reference(param["_file"], body_path_base)
-                        if _has_non_ascii(reference):
-                            warnings.append(
-                                "# WARNING: sidecar path {!r} contains non-ASCII "
-                                "characters; Windows curl may mis-encode it".format(
-                                    reference
-                                )
-                            )
-                        type_spec = ""
-                        if content_type:
-                            type_spec, normalized = _curl_content_type_spec(
-                                content_type
-                            )
-                            normalized_note = normalized_note or normalized
-                        if param.get("fileName") is not None:
-                            spec = "{}={}{}".format(
-                                param["name"], "@" + reference, type_spec
-                            )
-                            replay_filename = param.get("_wireFileName")
-                            if replay_filename is None:
-                                replay_filename = param.get("fileName")
-                            if replay_filename:
-                                if _has_non_ascii(replay_filename):
-                                    warnings.append(
-                                        "# WARNING: multipart filename {!r} contains "
-                                        "non-ASCII characters; Windows curl may "
-                                        "mis-encode it".format(replay_filename)
-                                    )
-                                spec += ";filename=" + _curl_filename(
-                                    replay_filename
-                                )
-                            elif replay_filename == "":
-                                spec += ';filename=""'
-                            parts.append("-F " + _shell_quote(spec))
-                        else:
-                            spec = "{}={}{}".format(
-                                param["name"], "<" + reference, type_spec
-                            )
-                            parts.append("-F " + _shell_quote(spec))
-                    else:
-                        # --form-string 按字面处理 @ 和 <；当值以这些字符
-                        # 开头时，-F 会上传或读取本地
-                        # 文件。
-                        parts.append(
-                            "--form-string "
-                            + _shell_quote(
-                                "{}={}".format(param["name"], param["value"])
-                            )
-                        )
-                if normalized_note:
-                    warnings.append(
-                        "# NOTE: curl normalizes multipart Content-Type parameter "
-                        "values; HAR keeps the exact header"
-                    )
-        elif analysis.kind in ("text", "form"):
-            if analysis.raw_file:
-                reference = _body_reference(analysis.raw_file, body_path_base)
-                if _has_non_ascii(reference):
-                    warnings.append(
-                        "# WARNING: sidecar path {!r} contains non-ASCII "
-                        "characters; Windows curl may mis-encode it".format(reference)
-                    )
-                parts.append("--data-binary " + _shell_quote("@" + reference))
-            else:
-                parts.append("--data-raw " + _shell_quote(analysis.text))
-        elif analysis.kind == "binary" and analysis.file:
-            reference = _body_reference(analysis.file, body_path_base)
-            if _has_non_ascii(reference):
-                warnings.append(
-                    "# WARNING: sidecar path {!r} contains non-ASCII "
-                    "characters; Windows curl may mis-encode it".format(reference)
-                )
-            parts.append("--data-binary " + _shell_quote("@" + reference))
-
-        body_via_data = analysis.kind in ("text", "form") or (
-            analysis.kind == "binary" and bool(analysis.file)
-        )
-        if has_body and body_via_data and not original_has_content_type:
-            # curl 会为 --data-* 添加 application/x-www-form-urlencoded；
-            # 当捕获的请求没有 Content-Type 时将其移除。
-            parts.append("-H " + _shell_quote("Content-Type:"))
-
-        parts.append(_shell_quote(request.url))
-
-        label = method if method_is_token else repr(method)
-        block = ["# {} {} {} -> {}".format(index, label, request.url, status)]
-        if uncaptured:
-            warnings.append(
-                "# WARNING: request body was not captured; CL/TE headers removed"
-            )
-        block.extend(warnings)
-        block.append(" ".join(parts))
-        blocks.append("\n".join(block))
-
-    if not blocks:
-        return ""
-    header = (
-        "# Generated by pytest-traffic-capture. POSIX shell syntax "
-        "(bash/zsh/Git Bash).\n"
-        "# Sidecar files use absolute paths from the machine that wrote them.\n"
-        "# Content-Length is omitted for captured bodies so curl recomputes it.\n\n"
-    )
-    return header + "\n\n".join(blocks) + "\n"

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import shlex
 from types import SimpleNamespace
 
 import pytest
@@ -19,8 +18,6 @@ from pytest_traffic_capture.adapters import (
     _snapshot_file,
     _TeeReader,
 )
-from pytest_traffic_capture.exporters import build_curl
-from pytest_traffic_capture.model import Exchange, RequestRecord
 from pytest_traffic_capture.recorder import (
     _TestSession,
     _atomic_write_text,
@@ -66,19 +63,6 @@ def test_tee_reader_records_stream_bytes():
     assert b"".join(collector.chunks) == b"abcdef"
     assert reader.read() == b""
     assert collector.eof is True
-
-
-def test_aiohttp_quote_fields_false_keeps_raw_filename():
-    aiohttp = pytest.importorskip("aiohttp")
-    form = aiohttp.FormData(quote_fields=False)
-    form.add_field(
-        "file", b"abc", filename="文件.txt", content_type="text/plain"
-    )
-
-    payload = _aiohttp_payload(form)
-
-    assert payload.parts[0].filename == "文件.txt"
-    assert payload.parts[0].wire_filename == "文件.txt"
 
 
 def test_aiohttp_connector_error_is_treated_as_not_sent():
@@ -289,49 +273,6 @@ def test_snapshot_file_keeps_body_below_limit_when_size_is_unknown():
     assert snapshot.truncated is False
     assert snapshot.data == b"y" * 50
     assert stream.tell() == 0
-
-
-def test_curl_quotes_method_tokens_with_shell_metacharacters():
-    exchange = Exchange(
-        request=RequestRecord(method="GET|`id`", url="http://example.test/x")
-    )
-
-    curl = build_curl([exchange])
-    command = next(line for line in curl.splitlines() if line.startswith("curl "))
-
-    assert shlex.split(command) == [
-        "curl",
-        "-X",
-        "GET|`ID`",
-        "http://example.test/x",
-    ]
-    assert "-X 'GET|`ID`'" in curl
-
-
-def test_curl_skips_invalid_method_and_warns():
-    exchange = Exchange(
-        request=RequestRecord(method="GET; id", url="http://example.test/x")
-    )
-
-    curl = build_curl([exchange])
-    command = next(line for line in curl.splitlines() if line.startswith("curl "))
-
-    assert "invalid HTTP method" in curl
-    assert "-X" not in shlex.split(command)
-    assert "GET; ID" not in shlex.split(command)
-
-
-@pytest.mark.parametrize("method", ["GET\nID", "GET\n", "GET; id"])
-def test_curl_comment_does_not_break_on_newline_method(method):
-    exchange = Exchange(
-        request=RequestRecord(method=method, url="http://example.test/x")
-    )
-
-    curl = build_curl([exchange])
-
-    for line in curl.splitlines():
-        if line.strip():
-            assert line.startswith("#") or line.startswith("curl ")
 
 
 def test_safe_hint_strips_control_characters():

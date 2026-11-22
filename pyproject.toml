@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytest-traffic-capture"
-description = "Capture requests/httpx/aiohttp traffic during tests as HAR 1.2 and cURL commands"
-version = "0.2.0"
+description = "Capture requests/httpx/aiohttp traffic during tests as HAR 1.2 documents"
+version = "0.3.0"
 readme = "README.rst"
 requires-python = ">=3.9"
 authors = [

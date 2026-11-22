@@ -7,7 +7,7 @@ import hashlib
 
 
 def test_httpx_file_upload_is_captured(
-    pytester, http_server, read_har, read_curl
+    pytester, http_server, read_har
 ):
     payload = b"\xff\xfe" + b"httpx-file" * 100
     upload = pytester.path / "payload.bin"
@@ -45,10 +45,9 @@ def test_httpx_file_upload_is_captured(
         / entry["request"]["postData"]["_file"]
     )
     assert sidecar.read_bytes() == payload
-    assert "--data-binary '@" in read_curl(pytester)
 
 
-def test_httpx_307_preserves_body(pytester, http_server, read_har, read_curl):
+def test_httpx_307_preserves_body(pytester, http_server, read_har):
     pytester.makepyfile(
         """
         import httpx
@@ -73,7 +72,6 @@ def test_httpx_307_preserves_body(pytester, http_server, read_har, read_curl):
     assert entries[1]["request"]["method"] == "POST"
     assert entries[1]["request"]["bodySize"] == 3
     assert entries[1]["request"]["postData"]["text"] == "abc"
-    assert "--data-raw 'abc'" in read_curl(pytester)
 
 
 def test_httpx_get_redirect_has_no_unreadable_body(

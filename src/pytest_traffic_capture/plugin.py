@@ -22,7 +22,7 @@ def pytest_addoption(parser) -> None:
         "--capture-traffic",
         action="store_true",
         default=False,
-        help="Capture requests/httpx/aiohttp traffic as HAR 1.2 and cURL commands.",
+        help="Capture requests/httpx/aiohttp traffic as HAR 1.2 documents.",
     )
     group.addoption(
         "--capture-dir",

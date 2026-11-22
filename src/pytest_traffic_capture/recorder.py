@@ -11,9 +11,9 @@ import tempfile
 import threading
 import warnings
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-from .exporters import build_curl, build_har
+from .exporters import build_har
 from .model import Exchange
 
 _UNSAFE_CHARS = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|\s]+')
@@ -123,17 +123,12 @@ class _TestSession:
     def har_path(self) -> Path:
         return self.out_dir / "{}.har".format(self.safe_name)
 
-    @property
-    def curl_path(self) -> Path:
-        return self.out_dir / "{}.curl.txt".format(self.safe_name)
-
     def cleanup_previous(self) -> None:
         """删除同一测试先前运行遗留的产物。"""
-        for path in (self.har_path, self.curl_path):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        try:
+            self.har_path.unlink()
+        except OSError:
+            pass
         body_dir = self.out_dir / "bodies"
         if not body_dir.is_dir():
             return
@@ -159,7 +154,7 @@ class _TestSession:
             _atomic_write_bytes(target, bytes(data))
         except Exception as exc:
             # 单个无法写入的旁挂文件(sidecar)（名称非法、路径过长、磁盘已满）
-            # 不应导致整个 HAR/cURL 产物丢失。
+            # 不应导致整个 HAR 产物丢失。
             _warn(
                 "pytest-traffic-capture: failed to write sidecar {}: {}".format(
                     relative, exc
@@ -217,7 +212,7 @@ class Recorder:
             raise RuntimeError("pytest_traffic_capture: no active test session")
         return session.save_body(hint, data)
 
-    def finish_test(self) -> Optional[Tuple[Path, Path]]:
+    def finish_test(self) -> Optional[Path]:
         with self._lock:
             session = self._session
             self._session = None
@@ -233,20 +228,11 @@ class Recorder:
                 max_inline_bytes=self.max_inline_bytes,
                 save_body=session.save_body,
             )
-            curl = build_curl(
-                session.exchanges,
-                save_body=session.save_body,
-                max_inline_bytes=self.max_inline_bytes,
-                body_path_base=self.out_dir,
-            )
 
-            # newline="" 在 Windows 上保持请求体中的 ``\n`` 和 ``\r\n`` 原样，
-            # 使生成的 cURL 命令重放完全相同的字节。
             _atomic_write_text(
                 session.har_path,
                 json.dumps(har, ensure_ascii=False, indent=2),
             )
-            _atomic_write_text(session.curl_path, curl)
         except Exception as exc:
             with self._lock:
                 self.write_failures += 1
@@ -262,7 +248,7 @@ class Recorder:
         with self._lock:
             self._total_exchanges += len(session.exchanges)
             self._truncated_bodies += _count_truncated(har)
-        return session.har_path, session.curl_path
+        return session.har_path
 
     @staticmethod
     def _clear_lazy_bodies() -> None:

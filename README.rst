@@ -2,20 +2,18 @@ pytest-traffic-capture
 ======================
 
 在 pytest 运行期间捕获 ``requests``、``httpx`` 和 ``aiohttp`` 的流量，并将其写为
-HAR 1.2 文档以及可重放的 cURL 命令。
+HAR 1.2 文档。
 
 功能特性
 --------
 
 * 捕获使用 ``requests``、``httpx`` （同步和异步）以及 ``aiohttp`` 进行的 HTTP
   交换。
-* 每个测试写入一个 ``.har`` 文件和一个 ``.curl.txt`` 文件。
+* 每个测试写入一个 ``.har`` 文件。
 * 将较大的 body 移到 sidecar 文件，而不是撑大 HAR 文档。
 * 当调用方通过普通的 ``read``/``iter_content``/``iter_bytes`` API 消费 streaming
   响应时，惰性地记录它们。
-* 对 307/308 重定向跳转复用捕获的负载，使重放保留原始字节。
-* 通过使用 sidecar 和 ``--data-binary``，对非 UTF-8 请求 body 强制进行字节精确的
-  cURL 重放。
+* 对 307/308 重定向跳转复用捕获的负载，使每一跳都保留原始字节。
 
 环境要求
 ------------
@@ -49,14 +47,14 @@ HAR 1.2 文档以及可重放的 cURL 命令。
 
 ``--capture-max-inline-bytes N``
     保留在 HAR 文件中内联的最大 body 大小。更大的 body 会写入 ``bodies/``。
-    默认为 1 MiB。``0`` 会取消对文本请求 body 和响应 body 的大小限制。二进制和
-    multipart 请求 body 始终写入 sidecar 文件，以便 cURL 能够重放完全一致的字节。
+    默认为 1 MiB。``0`` 会取消对文本请求 body 和响应 body 的大小限制。二进制请求
+    body 和 multipart 文件部分始终写入 sidecar 文件。
 
 ``--capture-max-body-bytes N``
     每个请求或响应 body 捕获的最大字节数。更大的 body 会在产物中被截断，并标记
-    ``_truncated`` 和 ``_size``；cURL 重放会被标注为不完整。默认为 5 MiB，
+    ``_truncated`` 和 ``_size``。默认为 5 MiB，
     ``0`` 表示不限制。请求头和响应头始终完整保存，只有 body 会被截断；截断后的
-    产物只能重放请求头和已捕获的那部分 body。
+    产物只包含请求头和已捕获的那部分 body。
 
 同样的设置也可以在 ``pytest.ini`` 中配置::
 
@@ -72,7 +70,6 @@ HAR 1.2 文档以及可重放的 cURL 命令。
 
     captured_traffic/
     |-- traffic_tests_test_api.py_test_login_ab12cd34.har
-    |-- traffic_tests_test_api.py_test_login_ab12cd34.curl.txt
     `-- bodies/
 
 .. warning::
@@ -82,14 +79,12 @@ HAR 1.2 文档以及可重放的 cURL 命令。
    不支持将其指向项目根目录（``.``）或包含真实测试的目录。产物名称以 ``traffic_``
    开头，因此不会匹配 doctest 默认的 ``test*.txt`` glob。
 
-HAR 文件可以导入 Chrome DevTools 的 Network 面板。名称以 ``_`` 开头的字段（例如
-``_file``、``_streaming``、``_truncated``、``_redirects_truncated``、
-``_headers_synthesized`` 和 ``_wireFileName``）是用于 sidecar 引用和捕获元数据的
+HAR 文件可以导入 Chrome DevTools 的 Network 面板，也可以导入 Postman 等工具。
+名称以 ``_`` 开头的字段（例如
+``_file``、``_streaming``、``_truncated``、``_redirects_truncated`` 和
+``_headers_synthesized``）是用于 sidecar 引用和捕获元数据的
 HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中的 body 通过 ``_file``
 引用，浏览器 HAR 查看器不会显示它们；请打开 sidecar 文件来查看。
-
-``.curl.txt`` 中的命令使用 POSIX shell 语法（bash/zsh/Git Bash），并通过生成它们的
-机器上的绝对路径来引用 sidecar body。在 WSL 上，重放前请用 ``wslpath`` 改写这些路径。
 
 有意设计
 -------------
@@ -97,14 +92,8 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
 以下行为是刻意采用的保守策略，用于如实反映线上流量，不是缺陷：
 
 * ``requests`` 的生成器和不可 seek 的流式上传会在客户端消费时通过 tee 捕获。如果
-  客户端提前停止，捕获的 body 会标记 ``_truncated``，重放不完整；此时线上确实没有
+  客户端提前停止，捕获的 body 会标记 ``_truncated``，产物不完整；此时线上确实没有
   发出完整字节。
-* 包含 ``=``、``;``、引号或控制字符的 multipart 字段名无法通过 curl 的 ``-F``
-  表达；这些请求改用原始 multipart body 和原始 ``Content-Type`` 头来重放。
-* curl 在重放时会规范化 multipart Content-Type 参数值（例如 ``charset="utf-8"``）；
-  HAR 保留完全一致的头。
-* 生成的 cURL 命令会为捕获的 body 省略 ``Content-Length``，以便 curl 重新计算它。
-  没有 body 的请求可能仍保留 ``Content-Length: 0``。
 * aiohttp 错误条目会重建 aiohttp 自动添加的头（``Accept``、``Accept-Encoding``、
   ``User-Agent``、``Host`` 和 cookies），并标记 ``_headers_synthesized``。
 
@@ -115,18 +104,12 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
   ``iter_raw()`` 或 ``requests`` 的 ``response.raw`` 会绕过收集。
 * requests、httpx 和 aiohttp 的重定向链都会被记录。无法完成的链会标记
   ``_redirects_truncated``；从未到达传输层的请求会标记 ``_not_sent``。
-* aiohttp 在传输时会对 multipart 文件名进行百分号编码。HAR 保留解码后的
-  ``fileName`` 以便阅读，并将传输形式存储在 ``_wireFileName`` 中；cURL 重放使用
-  传输形式。
+* aiohttp 在传输时会对 multipart 文件名进行百分号编码；HAR 保留解码后的
+  ``fileName`` 以便阅读。
 * 当 aiohttp 在生成的请求上暴露编码后的 ``bodySize`` 时，aiohttp ``FormData``
   请求会报告实测的编码 ``bodySize``；否则回退为 ``-1``。
 * 从 ``requests`` 响应钩子发起的嵌套请求会被捕获；重定向跳转由外层调用记录一次。
   显式传入 ``allow_redirects=False`` 的嵌套请求与重定向跳转无法区分，不会单独记录。
-* 非 ASCII 请求 body 和表单字段通过 sidecar 文件重放。从 Git Bash 调用时，原生
-  Windows ``curl`` 仍可能对非 ASCII 的 sidecar 路径或 multipart 文件名编码错误；
-  请优先使用 ASCII 捕获目录，或设置 ``MSYS2_ARG_CONV_EXCL='*'``。
-* 在 Windows Git Bash 上，MSYS 路径转换可能改写看起来像 POSIX 路径的参数（例如
-  ``@/etc/passwd``）；重放此类捕获命令时请设置 ``MSYS2_ARG_CONV_EXCL='*'``。
 * HAR ``timings`` 将实测总时长报告为 ``wait``：requests、httpx 和 aiohttp 都不暴露
   首字节时间或传输时长。httpx/aiohttp 记录的重定向跳转共享相同的起始时间，只有最后
   一跳携带实测时长。
@@ -134,7 +117,7 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
   解释器上固定 ``pytest<9.2``。即使没有本插件也会发生此失败。
 * 捕获的 streaming body、生成器上传和可 seek 的上传快照会在内存中缓冲，直到测试
   结束。``--capture-max-body-bytes`` 默认把每个 body 的缓冲限制在 5 MiB；客户端
-  仍会收到完整 body，但产物会被标记为截断，cURL 重放不完整。非流式调用（例如
+  仍会收到完整 body，但产物会被标记为截断。非流式调用（例如
   ``requests.get`` 不开 ``stream=True``）的内存开销由 HTTP 库本身决定，本插件无法
   降低。截断时终端摘要会提示被截断的 body 数量。
 
@@ -152,8 +135,8 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
     pip install tox
     tox
 
-测试套件包含一个本地 HTTP 服务器、重定向/上传/下载场景以及 cURL 重放测试（当
-``bash`` 不可用时会跳过重放）。``aiohttp39`` 环境用于检查与 aiohttp 3.9 的兼容性。
+测试套件包含一个本地 HTTP 服务器以及重定向/上传/下载场景。``aiohttp39`` 环境用于
+检查与 aiohttp 3.9 的兼容性。
 
 许可证
 -------

@@ -13,7 +13,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Sequence, Tuple
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 from .model import Exchange, RequestRecord, ResponseRecord
 from .multipart import Part
@@ -1292,13 +1292,6 @@ def _aiohttp_formdata_payload(data) -> _AiohttpPayload:
                 )
             if content_type is None:
                 content_type = _aiohttp_part_content_type(value, charset)
-            if filename is None:
-                wire_filename = None
-            elif getattr(data, "_quote_fields", True):
-                wire_filename = quote(str(filename), "", encoding=charset)
-            else:
-                # 在此模式下 aiohttp 写入的文件名不做百分号编码。
-                wire_filename = str(filename)
             part_truncated = False
             part_size = None
             if hasattr(value, "read"):
@@ -1311,7 +1304,6 @@ def _aiohttp_formdata_payload(data) -> _AiohttpPayload:
                             filename=(
                                 str(filename) if filename is not None else None
                             ),
-                            wire_filename=wire_filename,
                             content_type=content_type,
                             unreadable=True,
                             size=snapshot.size,
@@ -1336,7 +1328,6 @@ def _aiohttp_formdata_payload(data) -> _AiohttpPayload:
                     name=str(name),
                     value=body,
                     filename=str(filename) if filename is not None else None,
-                    wire_filename=wire_filename,
                     content_type=content_type,
                     truncated=part_truncated,
                     size=part_size,

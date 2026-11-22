@@ -235,14 +235,3 @@ def read_har():
         return json.loads(files[0].read_text(encoding="utf-8"))
 
     return _read
-
-
-@pytest.fixture
-def read_curl():
-    def _read(pytester):
-        out = pytester.path / "captured_traffic"
-        files = sorted(out.glob("*.curl.txt"))
-        assert len(files) == 1, files
-        return files[0].read_text(encoding="utf-8")
-
-    return _read

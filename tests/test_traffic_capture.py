@@ -41,7 +41,7 @@ def test_capture_is_opt_in(pytester):
     assert not (pytester.path / "captured_traffic").exists()
 
 
-def test_capture_writes_har_and_curl(pytester, http_server):
+def test_capture_writes_har(pytester, http_server):
     pytester.makepyfile(
         """
         import requests
@@ -59,15 +59,12 @@ def test_capture_writes_har_and_curl(pytester, http_server):
 
     out = pytester.path / "captured_traffic"
     har_files = sorted(out.glob("*.har"))
-    curl_files = sorted(out.glob("*.curl.txt"))
     assert len(har_files) == 1
-    assert len(curl_files) == 1
 
     har = json.loads(har_files[0].read_text(encoding="utf-8"))
     entry = har["log"]["entries"][0]
     assert entry["request"]["method"] == "GET"
     assert entry["response"]["status"] == 200
-    assert "curl " in curl_files[0].read_text(encoding="utf-8")
 
 
 def test_capture_dir_is_not_collected_by_doctest(pytester):

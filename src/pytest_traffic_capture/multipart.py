@@ -13,8 +13,6 @@ class Part:
     name: str
     value: bytes
     filename: Optional[str] = None
-    # aiohttp 实际传输时写出的百分号编码文件名。
-    wire_filename: Optional[str] = None
     content_type: Optional[str] = None
     unreadable: bool = False
     truncated: bool = False

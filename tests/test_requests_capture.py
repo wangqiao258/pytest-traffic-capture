@@ -26,7 +26,7 @@ def test_requests_redirect_chain_absolute_url(pytester, http_server, read_har):
     assert entries[1]["response"]["redirectURL"] == http_server + "/echo"
 
 
-def test_requests_307_preserves_body(pytester, http_server, read_har, read_curl):
+def test_requests_307_preserves_body(pytester, http_server, read_har):
     pytester.makepyfile(
         """
         import requests
@@ -47,11 +47,10 @@ def test_requests_307_preserves_body(pytester, http_server, read_har, read_curl)
     assert entries[1]["request"]["method"] == "POST"
     assert entries[1]["request"]["bodySize"] == 3
     assert entries[1]["request"]["postData"]["text"] == "abc"
-    assert "--data-raw 'abc'" in read_curl(pytester)
 
 
 def test_requests_307_file_like_upload_preserves_hop_body(
-    pytester, http_server, read_har, read_curl
+    pytester, http_server, read_har
 ):
     payload = b"hop-payload" * 200
     upload = pytester.path / "payload.bin"
@@ -89,7 +88,6 @@ def test_requests_307_file_like_upload_preserves_hop_body(
         assert post["_file"]
         sidecar = pytester.path / "captured_traffic" / post["_file"]
         assert sidecar.read_bytes() == payload
-    assert read_curl(pytester).count("--data-binary") == 2
 
 
 def test_requests_streaming_body_is_collected(
@@ -119,7 +117,7 @@ def test_requests_streaming_body_is_collected(
 
 
 def test_requests_non_utf8_body_uses_sidecar(
-    pytester, http_server, read_har, read_curl
+    pytester, http_server, read_har
 ):
     pytester.makepyfile(
         """
@@ -145,9 +143,6 @@ def test_requests_non_utf8_body_uses_sidecar(
     assert post["_file"]
     sidecar = pytester.path / "captured_traffic" / post["_file"]
     assert sidecar.read_bytes() == b"caf\xe9"
-    curl = read_curl(pytester)
-    assert "--data-binary '@" in curl
-    assert "--data-raw" not in curl
 
 
 def test_requests_redirect_loop_records_history(
@@ -336,7 +331,7 @@ def test_requests_buffered_response_cap(pytester, http_server, read_har):
 
 
 def test_requests_upload_cap_only_truncates_capture(
-    pytester, http_server, read_har, read_curl
+    pytester, http_server, read_har
 ):
     payload = b"x" * 4096
     upload = pytester.path / "payload.bin"
@@ -378,4 +373,3 @@ def test_requests_upload_cap_only_truncates_capture(
         pytester.path / "captured_traffic" / request["postData"]["_file"]
     )
     assert len(sidecar.read_bytes()) == 1024
-    assert "request body was truncated" in read_curl(pytester)
