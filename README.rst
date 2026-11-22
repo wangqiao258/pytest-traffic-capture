@@ -20,7 +20,7 @@ HAR 1.2 文档以及可重放的 cURL 命令。
 环境要求
 ------------
 
-* Python >= 3.8
+* Python >= 3.9
 * pytest >= 8
 * 被测项目中至少包含 ``requests``、``httpx`` 或 ``aiohttp`` 之一
 
