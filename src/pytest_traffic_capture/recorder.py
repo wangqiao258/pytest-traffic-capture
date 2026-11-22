@@ -97,6 +97,19 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _count_truncated(har) -> int:
+    """统计被截断的 body 数量，用于终端摘要提示。"""
+    count = 0
+    for entry in har.get("log", {}).get("entries", []):
+        request = entry.get("request") or {}
+        if request.get("_truncated"):
+            count += 1
+        content = (entry.get("response") or {}).get("content") or {}
+        if content.get("_truncated"):
+            count += 1
+    return count
+
+
 class _TestSession:
     def __init__(self, nodeid: str, out_dir: Path) -> None:
         self.nodeid = nodeid
@@ -171,11 +184,16 @@ class Recorder:
         self._lock = threading.RLock()
         self._session: Optional[_TestSession] = None
         self._total_exchanges = 0
+        self._truncated_bodies = 0
         self.write_failures = 0
 
     @property
     def total_exchanges(self) -> int:
         return self._total_exchanges
+
+    @property
+    def truncated_bodies(self) -> int:
+        return self._truncated_bodies
 
     def start_test(self, nodeid: str) -> None:
         session = _TestSession(nodeid, self.out_dir)
@@ -243,6 +261,7 @@ class Recorder:
 
         with self._lock:
             self._total_exchanges += len(session.exchanges)
+            self._truncated_bodies += _count_truncated(har)
         return session.har_path, session.curl_path
 
     @staticmethod

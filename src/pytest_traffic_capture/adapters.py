@@ -1227,20 +1227,20 @@ def _snapshot_file(
         # 文本模式的 ``tell()`` 可能返回不透明 cookie 而非字节偏移，
         # 因此只对二进制文件使用有界读取。
         binary = "b" in str(getattr(value, "mode", "b") or "b")
-        if (
-            limit > 0
-            and binary
-            and full_size is not None
-            and full_size > limit
-        ):
-            data = read(limit)
+        if limit > 0 and binary:
+            # 始终有界读取：即使拿不到文件大小（例如管道包装或异常流），
+            # 也不能把整个文件读进内存。
+            data = read(limit + 1)
             if isinstance(data, str):
                 data = data.encode(encoding)
-            return _Snapshot(
-                data=bytes(data),
-                size=full_size,
-                truncated=True,
-            )
+            data = bytes(data)
+            if len(data) > limit:
+                return _Snapshot(
+                    data=data[:limit],
+                    size=full_size,
+                    truncated=True,
+                )
+            return _Snapshot(data=data)
         data = read()
         if isinstance(data, str):
             data = data.encode(encoding)

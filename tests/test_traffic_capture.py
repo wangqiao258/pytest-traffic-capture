@@ -143,3 +143,57 @@ def test_captured_artifacts_do_not_leak_into_later_runs(pytester, http_server):
     second = pytester.runpytest_subprocess("-q")
 
     second.assert_outcomes(passed=1)
+
+
+def test_default_body_cap_truncates_large_bodies(pytester, http_server, read_har):
+    size = 5 * 1024 * 1024 + 1
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_big():
+            response = requests.get(
+                {url!r} + "/download?size={size}", timeout=10
+            )
+            assert len(response.content) == {size}
+        """.format(url=http_server, size=size)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    result.stdout.fnmatch_lines(["*truncated 1 body(ies)*"])
+    entry = read_har(pytester)["log"]["entries"][0]
+    content = entry["response"]["content"]
+    assert content["size"] == 5 * 1024 * 1024
+    assert content["_truncated"] is True
+    assert content["_size"] == size
+    assert entry["response"]["bodySize"] == -1
+    # 头部不受 body 截断影响。
+    assert entry["response"]["headers"]
+    assert entry["request"]["headers"]
+
+
+def test_zero_body_cap_disables_truncation(pytester, http_server, read_har):
+    size = 5 * 1024 * 1024 + 1
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_big():
+            response = requests.get(
+                {url!r} + "/download?size={size}", timeout=10
+            )
+            assert len(response.content) == {size}
+        """.format(url=http_server, size=size)
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "--capture-traffic", "--capture-max-body-bytes=0"
+    )
+
+    result.assert_outcomes(passed=1)
+    assert "truncated" not in result.stdout.str()
+    content = read_har(pytester)["log"]["entries"][0]["response"]["content"]
+    assert content["size"] == size
+    assert "_truncated" not in content

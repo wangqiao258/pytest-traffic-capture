@@ -13,6 +13,8 @@ from .recorder import Recorder
 
 _RECORDER_KEY = pytest.StashKey[Recorder]()
 
+_DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
+
 
 def pytest_addoption(parser) -> None:
     group = parser.getgroup("traffic-capture", "HTTP traffic capture")
@@ -49,7 +51,8 @@ def pytest_addoption(parser) -> None:
         metavar="N",
         help=(
             "Maximum bytes captured per request or response body; larger "
-            "bodies are truncated and marked (0 disables the limit)."
+            "bodies are truncated and marked (default: 5 MiB, 0 disables "
+            "the limit)."
         ),
     )
     parser.addini(
@@ -65,7 +68,7 @@ def pytest_addoption(parser) -> None:
     parser.addini(
         "capture_traffic_max_body_bytes",
         "Maximum bytes captured per request or response body.",
-        default="0",
+        default=str(_DEFAULT_MAX_BODY_BYTES),
     )
 
 
@@ -100,7 +103,10 @@ def _resolve_max_inline(config) -> int:
 def _resolve_max_body_bytes(config) -> int:
     value = config.getoption("capture_max_body_bytes")
     if value is None:
-        value = config.getini("capture_traffic_max_body_bytes") or "0"
+        value = (
+            config.getini("capture_traffic_max_body_bytes")
+            or str(_DEFAULT_MAX_BODY_BYTES)
+        )
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -192,6 +198,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
             "captured {} exchange(s) into {}".format(
                 recorder.total_exchanges, recorder.out_dir
             )
+        )
+    if recorder.truncated_bodies:
+        terminalreporter.write_line(
+            "truncated {} body(ies); raise --capture-max-body-bytes to "
+            "capture more".format(recorder.truncated_bodies)
         )
     if recorder.write_failures:
         terminalreporter.write_line(

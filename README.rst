@@ -54,7 +54,9 @@ HAR 1.2 文档以及可重放的 cURL 命令。
 
 ``--capture-max-body-bytes N``
     每个请求或响应 body 捕获的最大字节数。更大的 body 会在产物中被截断，并标记
-    ``_truncated`` 和 ``_size``；cURL 重放会被标注为不完整。默认为 ``0`` （无限制）。
+    ``_truncated`` 和 ``_size``；cURL 重放会被标注为不完整。默认为 5 MiB，
+    ``0`` 表示不限制。请求头和响应头始终完整保存，只有 body 会被截断；截断后的
+    产物只能重放请求头和已捕获的那部分 body。
 
 同样的设置也可以在 ``pytest.ini`` 中配置::
 
@@ -123,8 +125,10 @@ HAR 扩展字段；浏览器查看器会忽略它们。存储在 ``bodies/`` 中
 * ``pytest`` 9.2.0 在 Python 3.10.0 上收集时会因上游 ``NodeId`` 错误而失败；请在该
   解释器上固定 ``pytest<9.2``。即使没有本插件也会发生此失败。
 * 捕获的 streaming body、生成器上传和可 seek 的上传快照会在内存中缓冲，直到测试
-  结束。设置 ``--capture-max-body-bytes`` 可限制捕获的部分；客户端仍会收到完整
-  body，但产物会被标记为截断，cURL 重放不完整。
+  结束。``--capture-max-body-bytes`` 默认把每个 body 的缓冲限制在 5 MiB；客户端
+  仍会收到完整 body，但产物会被标记为截断，cURL 重放不完整。非流式调用（例如
+  ``requests.get`` 不开 ``stream=True``）的内存开销由 HTTP 库本身决定，本插件无法
+  降低。截断时终端摘要会提示被截断的 body 数量。
 * aiohttp 错误条目会重建 aiohttp 自动添加的头（``Accept``、``Accept-Encoding``、
   ``User-Agent``、``Host`` 和 cookies），并标记 ``_headers_synthesized``。
 

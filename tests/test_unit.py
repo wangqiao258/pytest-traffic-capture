@@ -237,6 +237,60 @@ def test_snapshot_file_rejects_stream_that_reports_unseekable():
     assert snapshot.unreadable is True
 
 
+class _UnknownSizeStream:
+    """可回绕但没有 ``fileno`` 的二进制流，模拟拿不到文件大小的情况。"""
+
+    mode = "rb"
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._position = 0
+        self.bytes_read = 0
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self._data) - self._position
+        end = self._position + size
+        data = self._data[self._position:end]
+        self._position = end
+        self.bytes_read += len(data)
+        return data
+
+    def tell(self):
+        return self._position
+
+    def seek(self, position, whence=0):
+        self._position = position
+        return position
+
+    def seekable(self):
+        return True
+
+    def fileno(self):
+        raise OSError("no file descriptor")
+
+
+def test_snapshot_file_bounds_read_when_size_is_unknown():
+    stream = _UnknownSizeStream(b"x" * 4096)
+
+    snapshot = _snapshot_file(stream, limit=100)
+
+    assert snapshot.truncated is True
+    assert snapshot.data == b"x" * 100
+    assert stream.bytes_read == 101
+    assert stream.tell() == 0
+
+
+def test_snapshot_file_keeps_body_below_limit_when_size_is_unknown():
+    stream = _UnknownSizeStream(b"y" * 50)
+
+    snapshot = _snapshot_file(stream, limit=100)
+
+    assert snapshot.truncated is False
+    assert snapshot.data == b"y" * 50
+    assert stream.tell() == 0
+
+
 def test_curl_quotes_method_tokens_with_shell_metacharacters():
     exchange = Exchange(
         request=RequestRecord(method="GET|`id`", url="http://example.test/x")
