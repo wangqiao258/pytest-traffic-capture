@@ -27,13 +27,39 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _read_body(self) -> bytes:
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return self._read_chunked_body()
         length = self.headers.get("Content-Length")
         if not length:
             return b""
         try:
-            return self.rfile.read(int(length))
+            body = self.rfile.read(int(length))
         except (ValueError, OSError):
-            return b""
+            body = b""
+        return body
+
+    def _read_chunked_body(self) -> bytes:
+        chunks = []
+        try:
+            while True:
+                line = self.rfile.readline(65536)
+                if not line:
+                    break
+                size_field = line.split(b";", 1)[0].strip()
+                if not size_field:
+                    break
+                size = int(size_field, 16)
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline(65536)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline(65536)
+        except (ValueError, OSError):
+            pass
+        return b"".join(chunks)
 
     def _write(
         self,
