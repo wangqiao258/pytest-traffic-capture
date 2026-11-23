@@ -194,3 +194,38 @@ def test_zero_body_cap_disables_truncation(pytester, http_server, read_har):
     content = read_har(pytester)["log"]["entries"][0]["response"]["content"]
     assert content["size"] == size
     assert "_truncated" not in content
+
+
+def test_har_records_test_nodeid(pytester, http_server, read_har):
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_http():
+            assert requests.get({url!r}, timeout=5).status_code == 200
+        """.format(url=http_server + "/echo")
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    meta = read_har(pytester)["log"]["_test"]
+    assert meta["nodeid"].endswith("::test_http")
+    assert meta["exchanges"] == 1
+
+
+def test_har_records_nodeid_when_test_fails(pytester, http_server, read_har):
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_http():
+            assert requests.get({url!r}, timeout=5).status_code == 500
+        """.format(url=http_server + "/echo")
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(failed=1)
+    meta = read_har(pytester)["log"]["_test"]
+    assert meta["nodeid"].endswith("::test_http")

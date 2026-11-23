@@ -26,6 +26,7 @@ from pytest_traffic_capture.adapters import (
 from pytest_traffic_capture.exporters import (
     _request_cookies,
     _response_cookies,
+    build_har,
 )
 from pytest_traffic_capture.recorder import (
     _TestSession,
@@ -513,3 +514,14 @@ def test_httpx_async_tee_stream_captures_first_pass_only():
     assert first == second == b"abcd"
     assert collector.eof is True
     assert b"".join(collector.chunks) == b"abcd"
+
+
+def test_build_har_records_test_meta():
+    har = build_har([], test_meta={"nodeid": "tests/x.py::test_y", "exchanges": 0})
+
+    assert har["log"]["_test"] == {"nodeid": "tests/x.py::test_y", "exchanges": 0}
+
+
+def test_build_har_omits_test_meta_by_default():
+    """没有传 test_meta 时不能凭空多出一个字段（老调用方要能原样工作）。"""
+    assert "_test" not in build_har([])["log"]

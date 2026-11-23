@@ -61,6 +61,10 @@ HAR 1.2 文档。
     |-- traffic_tests_test_api.py_test_login_ab12cd34.har
     `-- bodies/
 
+每份 HAR 的 ``log._test`` 记录 ``nodeid``（原文）和 ``exchanges``（交换次数）。
+文件名是 nodeid 的清洗 + 截断 + 短哈希投影，不可逆；需要精确对号时读这个字段。
+以 ``_`` 开头的字段是本插件的扩展字段，HAR 查看器会忽略。
+
 .. warning::
 
    只要安装了本插件，捕获目录就会被排除在 pytest 收集之外，即使没有传入

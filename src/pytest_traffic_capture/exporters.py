@@ -608,6 +608,7 @@ def build_har(
     max_inline_bytes: int = 1048576,
     save_body: Optional[SaveBody] = None,
     creator: Optional[Dict] = None,
+    test_meta: Optional[Dict] = None,
 ) -> Dict:
     entries: List[Dict] = []
     for exchange in exchanges:
@@ -646,11 +647,14 @@ def build_har(
         if exchange.redirects_truncated:
             entry["_redirects_truncated"] = True
         entries.append(entry)
-    return {
-        "log": {
-            "version": "1.2",
-            "creator": creator
-            or {"name": "pytest-traffic-capture", "version": __version__},
-            "entries": entries,
-        }
+    log: Dict = {
+        "version": "1.2",
+        "creator": creator
+        or {"name": "pytest-traffic-capture", "version": __version__},
+        "entries": entries,
     }
+    if test_meta:
+        # 文件名是 nodeid 的有损投影（清洗 + 截断 + 单向 hash），下游无法还原。
+        # 这里存原文，让产物自己说清"我是哪条用例的"。
+        log["_test"] = test_meta
+    return {"log": log}
