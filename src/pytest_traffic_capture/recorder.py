@@ -227,6 +227,10 @@ class Recorder:
                 session.exchanges,
                 max_inline_bytes=self.max_inline_bytes,
                 save_body=session.save_body,
+                test_meta={
+                    "nodeid": session.nodeid,
+                    "exchanges": len(session.exchanges),
+                },
             )
 
             _atomic_write_text(
