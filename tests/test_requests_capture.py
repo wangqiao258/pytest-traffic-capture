@@ -464,3 +464,31 @@ def test_requests_multipart_text_field_respects_inline_cap(
         pytester.path / "captured_traffic" / params["blob"]["_file"]
     )
     assert sidecar.read_bytes() == blob.encode("utf-8")
+
+
+def test_requests_percent_filename_is_not_decoded(
+    pytester, http_server, read_har
+):
+    """requests 原样发送文件名；字面 ``%XX`` 不能被当成编码还原。"""
+    pytester.makepyfile(
+        """
+        import requests
+
+        def test_upload():
+            response = requests.post(
+                {url!r} + "/multipart",
+                files={{"file": ("50%20off.txt", b"abc")}},
+                timeout=5,
+            )
+            assert response.status_code == 200
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    params = {
+        item["name"]: item for item in request["postData"]["params"]
+    }
+    assert params["file"]["fileName"] == "50%20off.txt"

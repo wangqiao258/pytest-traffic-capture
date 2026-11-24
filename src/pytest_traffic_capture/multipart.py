@@ -6,6 +6,22 @@ from dataclasses import dataclass
 from email.parser import BytesParser
 from email.policy import default
 from typing import List, Optional
+from urllib.parse import unquote
+
+
+def _decode_filename(filename: Optional[str]) -> Optional[str]:
+    """还原 aiohttp 在线上对文件名做的百分号编码。
+
+    线上会写成 ``filename="%E6%96%87%E4%BB%B6.txt"``，而调用方传入的是
+    ``文件.txt``。仅当名字里确实含百分号转义时才解码；解码失败则原样返回。
+    """
+    if not filename or not isinstance(filename, str) or "%" not in filename:
+        return filename
+    try:
+        decoded = unquote(filename, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return filename
+    return decoded or filename
 
 
 @dataclass
@@ -20,11 +36,19 @@ class Part:
     source: str = ""
 
 
-def parse_multipart(body: bytes, content_type: str) -> Optional[List[Part]]:
+def parse_multipart(
+    body: bytes,
+    content_type: str,
+    decode_filenames: bool = False,
+) -> Optional[List[Part]]:
     """使用 *content_type* 中声明的 boundary 解析 *body*。
 
     当载荷不是标准库能够解析的 multipart 体时返回 ``None``。
     遇到格式错误的数据绝不抛出异常。
+
+    ``decode_filenames`` 仅用于 aiohttp 在线上传输的载荷：该库会对文件名
+    做百分号编码。requests/httpx 原样发送文件名，不能解码，否则含 ``%XX``
+    的字面文件名（如 ``50%20off.txt``）会被改坏。
     """
     if not body or "multipart/" not in (content_type or "").lower():
         return None
@@ -66,7 +90,13 @@ def parse_multipart(body: bytes, content_type: str) -> Optional[List[Part]]:
             Part(
                 name=str(name),
                 value=payload,
-                filename=str(filename) if filename is not None else None,
+                filename=(
+                    str(_decode_filename(filename))
+                    if decode_filenames
+                    else str(filename)
+                )
+                if filename is not None
+                else None,
                 content_type=part_type,
             )
         )

@@ -13,6 +13,8 @@ from pytest_traffic_capture.adapters import (
     _aiohttp_body_from_kwargs,
     _aiohttp_not_sent,
     _aiohttp_payload,
+    _aiohttp_wire_payload,
+    _AiohttpWireCapture,
     _BodyCollector,
     _httpx_not_sent,
     _make_reader_readuntil,
@@ -28,6 +30,7 @@ from pytest_traffic_capture.exporters import (
     _response_cookies,
     build_har,
 )
+from pytest_traffic_capture.multipart import parse_multipart
 from pytest_traffic_capture.recorder import (
     _TestSession,
     _atomic_write_text,
@@ -164,6 +167,80 @@ def test_aiohttp_pair_list_is_urlencoded():
 
     assert payload.unreadable is False
     assert payload.body == b"a=1&a=2"
+
+
+def test_aiohttp_kwargs_body_is_marked_synthesized():
+    payload = _aiohttp_body_from_kwargs({"json": {"a": 1}})
+
+    assert payload.body == b'{"a": 1}'
+    # 没有写入点样本时，这段字节是推导出来的，必须能被产物识别。
+    assert payload.synthesized is True
+
+
+def test_aiohttp_bodiless_request_is_not_marked_synthesized():
+    payload = _aiohttp_body_from_kwargs({})
+
+    assert payload.body is None
+    assert payload.synthesized is False
+
+
+def test_aiohttp_wire_capture_caps_while_collecting():
+    capture = _AiohttpWireCapture(limit=4)
+    capture.begin()
+    capture.append(b"abcd")
+    capture.append(b"ef")
+    capture.finish()
+
+    assert capture.body() == b"abcd"
+    assert capture.total == 6
+    assert capture.truncated is True
+    assert capture.complete is True
+
+
+def test_aiohttp_incomplete_wire_sample_is_never_authoritative():
+    payload = _aiohttp_body_from_kwargs({"data": b"abcdef"})
+    capture = _AiohttpWireCapture()
+    capture.begin()
+    capture.append(b"abc")
+
+    result = _aiohttp_wire_payload(payload, capture)
+
+    # 没有 write_eof：捕获到的只是前缀，不能冒充完整请求体。
+    assert result.body == b"abc"
+    assert result.truncated is True
+    assert result.synthesized is True
+    assert result.size is None
+
+
+def test_aiohttp_complete_wire_sample_replaces_derived_body():
+    payload = _aiohttp_body_from_kwargs({"data": b"abc"})
+    capture = _AiohttpWireCapture()
+    capture.begin()
+    capture.append(b"abc")
+    capture.finish()
+
+    result = _aiohttp_wire_payload(payload, capture)
+
+    assert result.body == b"abc"
+    assert result.truncated is False
+    assert result.synthesized is False
+    assert result.size == 3
+
+
+def test_multipart_filename_decoding_is_opt_in():
+    body = (
+        b'--b\r\nContent-Disposition: form-data; name="f"; '
+        b'filename="50%20off.txt"\r\n\r\nx\r\n--b--\r\n'
+    )
+    content_type = "multipart/form-data; boundary=b"
+
+    # requests/httpx 原样发送文件名，默认不能解码，否则会改坏字面文件名。
+    plain = parse_multipart(body, content_type)
+    # aiohttp 的线上格式对文件名做百分号编码，只有这条路径需要还原。
+    decoded = parse_multipart(body, content_type, decode_filenames=True)
+
+    assert plain[0].filename == "50%20off.txt"
+    assert decoded[0].filename == "50 off.txt"
 
 
 def test_requests_seekable_body_is_snapshotted_and_restored():

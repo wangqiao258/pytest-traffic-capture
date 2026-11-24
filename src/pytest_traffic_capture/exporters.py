@@ -275,7 +275,11 @@ def _analyze_request(
     size = len(body)
 
     if "multipart/form-data" in mime_type.lower() and "boundary=" in mime_type.lower():
-        parts = multipart.parse_multipart(body, mime_type)
+        parts = multipart.parse_multipart(
+            body,
+            mime_type,
+            decode_filenames=request.percent_encoded_filenames,
+        )
         if parts:
             params = []
             for part in parts:
@@ -419,6 +423,8 @@ def _request_entry(
     }
     if request.body_source:
         entry["_body_source"] = request.body_source
+    if request.body_synthesized:
+        entry["_body_synthesized"] = True
     if request.truncated:
         entry["_truncated"] = True
         if request.full_body_size is not None:
