@@ -1317,26 +1317,60 @@ class _AiohttpPayload:
     # 这类体可能与会真正发出的字节不同（例如自定义 ``json_serialize``），
     # 因此必须在产物里标出来。
     synthesized: bool = False
+    # 当体取自 aiohttp 的线上字节、multipart 文件名仍是百分号编码时为 True。
+    percent_encoded_filenames: bool = False
 
 
 class _AiohttpWireCapture:
-    """收集一次 ``ClientRequest.write_bytes`` 实际写入的载荷字节。"""
+    """收集一次 ``ClientRequest.write_bytes`` 实际写入的载荷字节。
 
-    __slots__ = ("chunks",)
+    与 ``_BodyCollector`` 一样边收边按上限截断，避免大体积上传在内存里
+    留下完整副本；``total`` 仍记录写入的总字节数。
+    """
 
-    def __init__(self) -> None:
-        self.chunks: List[bytes] = []
+    __slots__ = ("chunks", "total", "truncated", "complete", "limit")
+
+    def __init__(self, limit: int = 0) -> None:
+        self.limit = max(0, int(limit or 0))
+        self.begin()
 
     def begin(self) -> None:
         # 每次 ``write_bytes`` 是一次真正的发送（重定向会有多次）。
         # 只保留最近一次尝试，避免把多跳的载荷拼成一个体。
-        self.chunks = []
+        self.chunks: List[bytes] = []
+        self.total = 0
+        self.truncated = False
+        self.complete = False
 
     def append(self, data) -> None:
         try:
-            self.chunks.append(bytes(data))
+            data = bytes(data)
         except Exception:
-            pass
+            return
+        length = len(data)
+        self.total += length
+        if not length:
+            return
+        if self.limit > 0:
+            captured = self.total - length
+            if captured >= self.limit:
+                self.truncated = True
+                return
+            remaining = self.limit - captured
+            if length > remaining:
+                data = data[:remaining]
+                self.truncated = True
+        self.chunks.append(data)
+
+    def finish(self) -> None:
+        # ``write_eof`` 是 ``write_bytes`` 完整走完的标志；缺少它说明上传被
+        # 提前响应或连接错误打断，已收字节只是前缀。
+        self.complete = True
+
+    def abort(self) -> None:
+        # 写入被取消或出错。部分 aiohttp 版本在取消路径上也会调用
+        # ``write_eof``，因此这里必须显式撤销完成标记。
+        self.complete = False
 
     def body(self) -> Optional[bytes]:
         if not self.chunks:
@@ -1667,6 +1701,7 @@ def _request_from_aiohttp_info(
     body_source: str = "",
     truncated: bool = False,
     body_synthesized: bool = False,
+    percent_encoded_filenames: bool = False,
 ) -> RequestRecord:
     headers = [(str(key), str(value)) for key, value in info.headers.items()]
     return RequestRecord(
@@ -1679,6 +1714,7 @@ def _request_from_aiohttp_info(
         body_size=body_size,
         body_source=body_source,
         body_synthesized=body_synthesized,
+        percent_encoded_filenames=percent_encoded_filenames,
         parts=parts,
         truncated=truncated,
         full_body_size=body_size if truncated else None,
@@ -1697,6 +1733,7 @@ def _aiohttp_hop_request(hop, index: int, payload: _AiohttpPayload) -> RequestRe
             payload.source,
             payload.truncated,
             payload.synthesized,
+            payload.percent_encoded_filenames,
         )
     method = str(info.method).upper()
     if method in ("GET", "HEAD") or (
@@ -1721,6 +1758,7 @@ def _aiohttp_hop_request(hop, index: int, payload: _AiohttpPayload) -> RequestRe
             None,
             truncated=payload.truncated,
             body_synthesized=payload.synthesized,
+            percent_encoded_filenames=payload.percent_encoded_filenames,
         )
     return _request_from_aiohttp_info(
         info,
@@ -1880,6 +1918,7 @@ async def _request_from_aiohttp_kwargs(
         not_sent=_aiohttp_not_sent(exc) if exc is not None else False,
         headers_synthesized=True,
         body_synthesized=payload.synthesized,
+        percent_encoded_filenames=payload.percent_encoded_filenames,
         parts=payload.parts,
         truncated=payload.truncated,
         full_body_size=payload.size if payload.truncated else None,
@@ -1979,12 +2018,15 @@ class _PayloadTap:
         self._writer = writer
         self._capture = capture
 
-    async def write(self, data):
+    async def write(self, data, *args, **kwargs):
         self._capture.append(data)
-        return await self._writer.write(data)
+        return await self._writer.write(data, *args, **kwargs)
 
-    async def write_eof(self):
-        return await self._writer.write_eof()
+    async def write_eof(self, *args, **kwargs):
+        result = await self._writer.write_eof(*args, **kwargs)
+        # 只有走完 ``write_eof`` 才说明整个体都写进了传输层。
+        self._capture.finish()
+        return result
 
     def __getattr__(self, name):
         return getattr(self._writer, name)
@@ -2001,9 +2043,14 @@ def _make_aiohttp_write_bytes(original):
         # 此时不取样，让产物如实保留 synthesized 标记。
         if getattr(self, "compress", None):
             return await original(self, writer, *args, **kwargs)
-        return await original(
-            self, _PayloadTap(writer, capture), *args, **kwargs
-        )
+        try:
+            return await original(
+                self, _PayloadTap(writer, capture), *args, **kwargs
+            )
+        except BaseException:
+            # 写入被取消或出错：已收字节只是前缀，不能当作完整载荷。
+            capture.abort()
+            raise
 
     return write_bytes
 
@@ -2013,26 +2060,37 @@ def _aiohttp_wire_payload(payload, capture) -> _AiohttpPayload:
     if capture is None:
         return payload
     data = capture.body()
-    if not data:
+    if data is None:
         return payload
-    snapshot = _cap_bytes(data, _body_limit())
-    if snapshot.truncated and payload.parts is not None:
+    if not capture.complete:
+        # 上传没有走到 ``write_eof``：服务端可能提前响应或连接已中断，
+        # 已捕获的字节只是前缀。标记为不完整，bodySize 保持未知，
+        # 避免把前缀冒充成真实请求体。
+        return _AiohttpPayload(
+            body=data,
+            truncated=True,
+            synthesized=True,
+            percent_encoded_filenames=True,
+        )
+    if capture.truncated and payload.parts is not None:
         # 截断会切掉 multipart 的分段边界，无法再从字节里解析出结构。
         # 保留按 kwargs 记录的字段清单，长度取线上的真实值；这种体是推导的，
         # 因此仍标记为 synthesized。
         return _AiohttpPayload(
-            body=snapshot.data,
+            body=data,
             parts=payload.parts,
             truncated=True,
-            size=snapshot.size,
+            size=capture.total,
             synthesized=True,
         )
     # ``parts`` 留空：导出器会按 Content-Type 里的 boundary 解析真实字节，
     # 得到的是真正发出的分段，而不是照着 ``_fields`` 拼出来的描述。
+    # aiohttp 在线上对文件名做百分号编码，解析时需要还原。
     return _AiohttpPayload(
-        body=snapshot.data,
-        truncated=snapshot.truncated,
-        size=snapshot.size,
+        body=data,
+        truncated=capture.truncated,
+        size=capture.total,
+        percent_encoded_filenames=True,
     )
 
 
@@ -2112,7 +2170,7 @@ def _make_aiohttp_request(original):
                     )
                 )
 
-        capture = _AiohttpWireCapture()
+        capture = _AiohttpWireCapture(_body_limit())
         size_token = _aiohttp_body_size.set(None)
         wire_token = _aiohttp_wire_body.set(capture)
         try:

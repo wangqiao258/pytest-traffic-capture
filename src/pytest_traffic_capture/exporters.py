@@ -275,7 +275,11 @@ def _analyze_request(
     size = len(body)
 
     if "multipart/form-data" in mime_type.lower() and "boundary=" in mime_type.lower():
-        parts = multipart.parse_multipart(body, mime_type)
+        parts = multipart.parse_multipart(
+            body,
+            mime_type,
+            decode_filenames=request.percent_encoded_filenames,
+        )
         if parts:
             params = []
             for part in parts:

@@ -77,10 +77,12 @@ HAR 1.2 文档。
 
 * 直接使用 httpx 的 ``iter_raw()`` 或 ``requests`` 的 ``response.raw`` 会绕过收集。
 * aiohttp 的请求体在写入点（``ClientRequest.write_bytes``）取样，得到的是实际发出的
-  载荷字节，multipart 的 boundary 也是真的。只有当请求没走到写入点时（例如连接在
-  发送前就失败），才按 ``json=``/``data=`` 推导，并在 HAR 中标记
-  ``_body_synthesized``。带该标记的体不保证等于线上字节——会话级的
-  ``json_serialize`` 等设置会改变实际序列化结果，因此不应作为证据使用。
+  载荷字节，multipart 的 boundary 也是真的。只有当请求没走到写入点（例如连接在
+  发送前就失败）或传输层会压缩上传体时，才按 ``json=``/``data=`` 推导，并在 HAR 中
+  标记 ``_body_synthesized``。带该标记的体不保证等于线上字节——会话级的
+  ``json_serialize`` 等设置会改变实际序列化结果，因此不应作为证据使用。上传被
+  提前响应或连接中断打断时，只记录已经发出的前缀：标 ``_truncated`` 和
+  ``_body_synthesized``，``bodySize`` 为 ``-1``（真实长度未知）。
 * 显式传入 ``allow_redirects=False`` 的嵌套请求与重定向跳转无法区分，不会单独记录。
 * HAR ``timings`` 将实测总时长报告为 ``wait``：requests、httpx 和 aiohttp 都不暴露
   首字节时间或传输时长。httpx/aiohttp 记录的重定向跳转共享相同的起始时间，只有最后
