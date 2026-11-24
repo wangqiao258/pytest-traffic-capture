@@ -28,6 +28,9 @@ class RequestRecord:
     # 当头部是在本地重建、而非从客户端的请求对象读取时为 True
     # （aiohttp 的错误路径）。
     headers_synthesized: bool = False
+    # 当请求体是按 kwargs 推导、而非从写入点观测时为 True
+    # （aiohttp 的 ``write_bytes`` 未被调用，或会话级序列化器覆盖了默认行为）。
+    body_synthesized: bool = False
     # 预先解析的 multipart 字段（供 aiohttp.FormData 使用，该库会在
     # 请求交给传输层之前消费掉它）。
     parts: Optional[List[Any]] = None

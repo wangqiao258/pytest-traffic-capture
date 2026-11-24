@@ -44,6 +44,13 @@ _aiohttp_body_size: contextvars.ContextVar = contextvars.ContextVar(
     default=_AIOHTTP_SIZE_UNSET,
 )
 
+# aiohttp 把最终载荷（含 multipart 的 boundary）交给 ``ClientRequest``
+# 内部的 ``StreamWriter``。在这个写入点取样拿到的才是真正发出去的字节；
+# 从 ``json=``/``data=`` 重算只能算推断。ContextVar 让并发任务彼此独立。
+_aiohttp_wire_body: contextvars.ContextVar = contextvars.ContextVar(
+    "pytest_traffic_capture_aiohttp_wire_body", default=None
+)
+
 # 需要惰性捕获其载荷的 aiohttp 响应读取器。我们绝不能
 # 自己读取响应体：那样会破坏 iter_chunked()、SSE/长轮询
 # 以及任务取消。改为注册该读取器，并在*调用方*
@@ -244,6 +251,9 @@ def _patch_aiohttp() -> None:
         return
     _patch(ClientSession, "_request", _make_aiohttp_request)
     _patch(ClientRequest, "__init__", _make_aiohttp_client_request_init)
+    # 请求体的唯一可信来源：aiohttp 在这里把载荷逐段写进传输层。
+    if hasattr(ClientRequest, "write_bytes"):
+        _patch(ClientRequest, "write_bytes", _make_aiohttp_write_bytes)
 
 
 def _patch_aiohttp_streams() -> None:
@@ -1303,6 +1313,38 @@ class _AiohttpPayload:
     parts: Optional[List[Part]] = None
     size: Optional[int] = None
     source: str = ""
+    # 当体并非从写入点观测、而是按 ``json=``/``data=`` 推导时为 True。
+    # 这类体可能与会真正发出的字节不同（例如自定义 ``json_serialize``），
+    # 因此必须在产物里标出来。
+    synthesized: bool = False
+
+
+class _AiohttpWireCapture:
+    """收集一次 ``ClientRequest.write_bytes`` 实际写入的载荷字节。"""
+
+    __slots__ = ("chunks",)
+
+    def __init__(self) -> None:
+        self.chunks: List[bytes] = []
+
+    def begin(self) -> None:
+        # 每次 ``write_bytes`` 是一次真正的发送（重定向会有多次）。
+        # 只保留最近一次尝试，避免把多跳的载荷拼成一个体。
+        self.chunks = []
+
+    def append(self, data) -> None:
+        try:
+            self.chunks.append(bytes(data))
+        except Exception:
+            pass
+
+    def body(self) -> Optional[bytes]:
+        if not self.chunks:
+            return None
+        try:
+            return b"".join(self.chunks)
+        except Exception:
+            return None
 
 
 def _file_metadata(value) -> Tuple[Optional[int], str]:
@@ -1590,15 +1632,23 @@ def _aiohttp_payload(data) -> _AiohttpPayload:
 
 
 def _aiohttp_body_from_kwargs(kwargs) -> _AiohttpPayload:
+    """按 kwargs 描述待发载荷。这是推断值，会由写入点样本覆盖。"""
     if kwargs.get("json") is not None:
         try:
             # 与 aiohttp 自身的序列化保持一致（json.dumps 默认值）。
-            return _aiohttp_generated_body(
+            payload = _aiohttp_generated_body(
                 json.dumps(kwargs["json"]).encode("utf-8")
             )
         except (TypeError, ValueError):
-            return _AiohttpPayload(unreadable=True)
-    return _aiohttp_payload(kwargs.get("data"))
+            payload = _AiohttpPayload(unreadable=True)
+    else:
+        payload = _aiohttp_payload(kwargs.get("data"))
+    # 会话级的 ``json_serialize`` 等设置会让这段推导与线上字节不一致，
+    # 因此除非写入点拿到真实字节，否则一律标记为推导值。
+    # 没有体的请求（GET 等）不标记，避免给空体贴上误导性的标签。
+    if payload.body is not None or payload.parts is not None:
+        payload.synthesized = True
+    return payload
 
 
 def _aiohttp_http_version(version) -> str:
@@ -1616,6 +1666,7 @@ def _request_from_aiohttp_info(
     body_size: Optional[int] = None,
     body_source: str = "",
     truncated: bool = False,
+    body_synthesized: bool = False,
 ) -> RequestRecord:
     headers = [(str(key), str(value)) for key, value in info.headers.items()]
     return RequestRecord(
@@ -1627,6 +1678,7 @@ def _request_from_aiohttp_info(
         unreadable=unreadable,
         body_size=body_size,
         body_source=body_source,
+        body_synthesized=body_synthesized,
         parts=parts,
         truncated=truncated,
         full_body_size=body_size if truncated else None,
@@ -1644,6 +1696,7 @@ def _aiohttp_hop_request(hop, index: int, payload: _AiohttpPayload) -> RequestRe
             payload.size,
             payload.source,
             payload.truncated,
+            payload.synthesized,
         )
     method = str(info.method).upper()
     if method in ("GET", "HEAD") or (
@@ -1657,6 +1710,7 @@ def _aiohttp_hop_request(hop, index: int, payload: _AiohttpPayload) -> RequestRe
             False,
             payload.parts,
             truncated=any(part.truncated for part in payload.parts),
+            body_synthesized=payload.synthesized,
         )
     if payload.body is not None:
         # 307/308 保留原始方法和载荷。
@@ -1666,9 +1720,16 @@ def _aiohttp_hop_request(hop, index: int, payload: _AiohttpPayload) -> RequestRe
             False,
             None,
             truncated=payload.truncated,
+            body_synthesized=payload.synthesized,
         )
     return _request_from_aiohttp_info(
-        info, None, True, None, payload.size, payload.source
+        info,
+        None,
+        True,
+        None,
+        payload.size,
+        payload.source,
+        body_synthesized=payload.synthesized,
     )
 
 
@@ -1818,6 +1879,7 @@ async def _request_from_aiohttp_kwargs(
         body_source=payload.source,
         not_sent=_aiohttp_not_sent(exc) if exc is not None else False,
         headers_synthesized=True,
+        body_synthesized=payload.synthesized,
         parts=payload.parts,
         truncated=payload.truncated,
         full_body_size=payload.size if payload.truncated else None,
@@ -1904,6 +1966,76 @@ def _register_reader(response) -> Optional[_BodyCollector]:
     return collector
 
 
+class _PayloadTap:
+    """``StreamWriter`` 的旁路：复制载荷字节后原样转发。
+
+    只旁听，不改写入语义；旁路在 chunked 分帧与压缩之前，
+    因此拿到的是 HTTP 载荷本身。
+    """
+
+    __slots__ = ("_writer", "_capture")
+
+    def __init__(self, writer, capture) -> None:
+        self._writer = writer
+        self._capture = capture
+
+    async def write(self, data):
+        self._capture.append(data)
+        return await self._writer.write(data)
+
+    async def write_eof(self):
+        return await self._writer.write_eof()
+
+    def __getattr__(self, name):
+        return getattr(self._writer, name)
+
+
+def _make_aiohttp_write_bytes(original):
+    async def write_bytes(self, writer, *args, **kwargs):
+        capture = _aiohttp_wire_body.get()
+        if capture is None:
+            return await original(self, writer, *args, **kwargs)
+        # 每次调用都是一次真正的发送（重定向会有多次），重开一段样本。
+        capture.begin()
+        # 传输层会压缩上传体时，写入点看到的是压缩前的字节，与线上不一致。
+        # 此时不取样，让产物如实保留 synthesized 标记。
+        if getattr(self, "compress", None):
+            return await original(self, writer, *args, **kwargs)
+        return await original(
+            self, _PayloadTap(writer, capture), *args, **kwargs
+        )
+
+    return write_bytes
+
+
+def _aiohttp_wire_payload(payload, capture) -> _AiohttpPayload:
+    """用写入点观测到的字节替换按 kwargs 推导出的请求体。"""
+    if capture is None:
+        return payload
+    data = capture.body()
+    if not data:
+        return payload
+    snapshot = _cap_bytes(data, _body_limit())
+    if snapshot.truncated and payload.parts is not None:
+        # 截断会切掉 multipart 的分段边界，无法再从字节里解析出结构。
+        # 保留按 kwargs 记录的字段清单，长度取线上的真实值；这种体是推导的，
+        # 因此仍标记为 synthesized。
+        return _AiohttpPayload(
+            body=snapshot.data,
+            parts=payload.parts,
+            truncated=True,
+            size=snapshot.size,
+            synthesized=True,
+        )
+    # ``parts`` 留空：导出器会按 Content-Type 里的 boundary 解析真实字节，
+    # 得到的是真正发出的分段，而不是照着 ``_fields`` 拼出来的描述。
+    return _AiohttpPayload(
+        body=snapshot.data,
+        truncated=snapshot.truncated,
+        size=snapshot.size,
+    )
+
+
 def _make_aiohttp_client_request_init(original):
     def __init__(self, *args, **kwargs):
         original(self, *args, **kwargs)
@@ -1980,17 +2112,23 @@ def _make_aiohttp_request(original):
                     )
                 )
 
+        capture = _AiohttpWireCapture()
         size_token = _aiohttp_body_size.set(None)
+        wire_token = _aiohttp_wire_body.set(capture)
         try:
             response = await original(self, method, str_or_url, **kwargs)
         except BaseException as exc:
+            payload = _aiohttp_wire_payload(payload, capture)
             _apply_aiohttp_body_size(payload)
             await record_error_chain(exc)
             raise
         finally:
             _apply_aiohttp_body_size(payload)
             _aiohttp_body_size.reset(size_token)
+            _aiohttp_wire_body.reset(wire_token)
 
+        # 请求已经写出去，用写入点观测到的字节替换先前的推导值。
+        payload = _aiohttp_wire_payload(payload, capture)
         elapsed = _elapsed_ms(start)
         hops = list(getattr(response, "history", None) or []) + [response]
         collector = _register_reader(response)

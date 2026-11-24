@@ -698,3 +698,119 @@ def test_aiohttp_formdata_text_field_respects_inline_cap(
         pytester.path / "captured_traffic" / params["blob"]["_file"]
     )
     assert sidecar.read_bytes() == blob.encode("utf-8")
+
+
+def test_aiohttp_json_body_follows_session_serializer(
+    pytester, http_server, read_har
+):
+    """请求体必须取自写入点，而不是按 json.dumps 默认值重算。
+
+    会话级 ``json_serialize`` 是 aiohttp 的公开参数；重算会记下与线上
+    不同的字节（默认 ensure_ascii 会把中文转义，并多出空格）。
+    """
+    pytester.makepyfile(
+        r"""
+        import asyncio
+        import json
+
+        import aiohttp
+
+        def test_post():
+            async def scenario():
+                def serialize(value):
+                    return json.dumps(
+                        value, ensure_ascii=False, separators=(",", ":")
+                    )
+
+                async with aiohttp.ClientSession(
+                    json_serialize=serialize
+                ) as session:
+                    async with session.post(
+                        {url!r} + "/echo",
+                        json={{"名字": "张三"}},
+                        timeout=5,
+                    ) as response:
+                        await response.read()
+
+            asyncio.run(scenario())
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    expected = '{"名字":"张三"}'
+    assert request["postData"]["text"] == expected
+    assert request["bodySize"] == len(expected.encode("utf-8"))
+    assert "_body_synthesized" not in request
+
+
+def test_aiohttp_multipart_size_matches_content_length(
+    pytester, http_server, read_har
+):
+    """multipart 的 bodySize 必须等于线上 Content-Length。"""
+    pytester.makepyfile(
+        """
+        import asyncio
+
+        import aiohttp
+
+        def test_upload():
+            async def scenario():
+                form = aiohttp.FormData()
+                form.add_field("name", "张三")
+                form.add_field("file", b"abc", filename="a.bin")
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        {url!r} + "/echo", data=form, timeout=5
+                    ) as response:
+                        await response.read()
+
+            asyncio.run(scenario())
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    length = next(
+        header["value"]
+        for header in request["headers"]
+        if header["name"].lower() == "content-length"
+    )
+    assert request["bodySize"] == int(length)
+    assert "_body_synthesized" not in request
+
+
+def test_aiohttp_compressed_upload_is_marked_synthesized(
+    pytester, http_server, read_har
+):
+    """传输层会压缩上传体时，写入点不是线上字节，必须标记为推导值。"""
+    pytester.makepyfile(
+        """
+        import asyncio
+
+        import aiohttp
+
+        def test_upload():
+            async def scenario():
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        {url!r} + "/empty",
+                        data=b"x" * 4096,
+                        compress="deflate",
+                        timeout=5,
+                    ) as response:
+                        await response.read()
+
+            asyncio.run(scenario())
+        """.format(url=http_server)
+    )
+
+    result = pytester.runpytest_subprocess("-q", "--capture-traffic")
+
+    result.assert_outcomes(passed=1)
+    request = read_har(pytester)["log"]["entries"][0]["request"]
+    assert request["_body_synthesized"] is True

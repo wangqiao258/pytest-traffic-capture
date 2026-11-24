@@ -419,6 +419,8 @@ def _request_entry(
     }
     if request.body_source:
         entry["_body_source"] = request.body_source
+    if request.body_synthesized:
+        entry["_body_synthesized"] = True
     if request.truncated:
         entry["_truncated"] = True
         if request.full_body_size is not None:

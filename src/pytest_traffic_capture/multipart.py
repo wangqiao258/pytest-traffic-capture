@@ -6,6 +6,22 @@ from dataclasses import dataclass
 from email.parser import BytesParser
 from email.policy import default
 from typing import List, Optional
+from urllib.parse import unquote
+
+
+def _decode_filename(filename: Optional[str]) -> Optional[str]:
+    """还原 aiohttp 在线上对文件名做的百分号编码。
+
+    线上会写成 ``filename="%E6%96%87%E4%BB%B6.txt"``，而调用方传入的是
+    ``文件.txt``。仅当名字里确实含百分号转义时才解码；解码失败则原样返回。
+    """
+    if not filename or not isinstance(filename, str) or "%" not in filename:
+        return filename
+    try:
+        decoded = unquote(filename, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return filename
+    return decoded or filename
 
 
 @dataclass
@@ -66,7 +82,9 @@ def parse_multipart(body: bytes, content_type: str) -> Optional[List[Part]]:
             Part(
                 name=str(name),
                 value=payload,
-                filename=str(filename) if filename is not None else None,
+                filename=str(_decode_filename(filename))
+                if filename is not None
+                else None,
                 content_type=part_type,
             )
         )

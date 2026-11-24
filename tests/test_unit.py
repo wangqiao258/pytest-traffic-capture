@@ -166,6 +166,21 @@ def test_aiohttp_pair_list_is_urlencoded():
     assert payload.body == b"a=1&a=2"
 
 
+def test_aiohttp_kwargs_body_is_marked_synthesized():
+    payload = _aiohttp_body_from_kwargs({"json": {"a": 1}})
+
+    assert payload.body == b'{"a": 1}'
+    # 没有写入点样本时，这段字节是推导出来的，必须能被产物识别。
+    assert payload.synthesized is True
+
+
+def test_aiohttp_bodiless_request_is_not_marked_synthesized():
+    payload = _aiohttp_body_from_kwargs({})
+
+    assert payload.body is None
+    assert payload.synthesized is False
+
+
 def test_requests_seekable_body_is_snapshotted_and_restored():
     handle = io.BytesIO(b"abc")
     prepared = SimpleNamespace(
